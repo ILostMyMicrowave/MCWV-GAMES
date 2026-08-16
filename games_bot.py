@@ -2729,11 +2729,40 @@ def games_build_round_image(icon_bytes, mode="zoom"):
     try:
         img = Image.open(BytesIO(icon_bytes)).convert("RGBA")
         if mode == "silhouette":
-            # black fill on the pet's alpha shape
-            alpha = img.split()[3]
-            solid = Image.new("RGBA", img.size, (5, 6, 12, 255))
-            solid.putalpha(alpha.point(lambda a: 255 if a > 40 else 0))
-            img = solid
+            # A flat black alpha mask becomes a black rectangle for many real
+            # API icons (their artwork fills an opaque square). Render a dark
+            # duotone shadow with neon contours instead, so the pet stays
+            # mysterious while its shape/details remain visible.
+            backdrop = Image.new("RGBA", img.size, (6, 4, 20, 255))
+            backdrop.alpha_composite(img)
+            source_rgb = backdrop.convert("RGB")
+            gray = ImageOps.autocontrast(ImageOps.grayscale(source_rgb), cutoff=2)
+            shadow = ImageOps.colorize(
+                gray,
+                black=(2, 3, 12),
+                mid=(12, 8, 30),
+                white=(46, 18, 66),
+                blackpoint=0,
+                midpoint=112,
+                whitepoint=255,
+            )
+            edges = ImageOps.autocontrast(
+                ImageOps.grayscale(source_rgb).filter(ImageFilter.FIND_EDGES),
+                cutoff=3,
+            )
+            edges = edges.point(lambda value: 0 if value < 24 else min(220, (value - 24) * 3))
+            edges = edges.filter(ImageFilter.GaussianBlur(radius=max(0.6, min(img.size) / 420)))
+            glow = Image.new("RGB", img.size, (0, 0, 0))
+            glow.paste((118, 76, 245), mask=edges)
+            shadow = ImageChops.screen(shadow, glow)
+            frame = ImageDraw.Draw(shadow)
+            frame.rounded_rectangle(
+                (3, 3, img.width - 4, img.height - 4),
+                radius=max(8, min(img.size) // 24),
+                outline=(104, 70, 220),
+                width=max(2, min(img.size) // 150),
+            )
+            img = shadow.convert("RGBA")
         elif mode == "blur":
             img = img.filter(ImageFilter.GaussianBlur(radius=max(5, min(img.size) // 18)))
         elif mode == "monochrome":
@@ -3040,9 +3069,20 @@ async def games_start_guess_round(channel, pet_key=None, mode=None, rewarded=Tru
         clock = asyncio.create_task(games_guess_clock(channel_id, started))
         ACTIVE_GUESS_TASKS[channel_id] = clock
         return round_info
+    except discord.Forbidden as exc:
+        print(f"[games] guess round start failed: {exc}")
+        if getattr(exc, "code", None) == 50001:
+            return (
+                "❌ I cannot access this channel. Add **MCWV Games** to the channel/thread and allow "
+                "View Channel, Send Messages, Embed Links, Attach Files, and Read Message History."
+            )
+        return (
+            "❌ I cannot post the round here. Allow **MCWV Games** to Send Messages, Embed Links, "
+            "Attach Files, and Send Messages in Threads (when applicable)."
+        )
     except Exception as exc:
         print(f"[games] guess round start failed: {exc}")
-        return None
+        return "❌ Round setup failed unexpectedly. Game staff can check the Render log for the exact cause."
     finally:
         ACTIVE_GUESS_STARTING.discard(channel_id)
         ACTIVE_GUESS_CANCEL_REQUESTS.discard(channel_id)
@@ -3326,8 +3366,10 @@ async def games_guess(interaction: discord.Interaction, action: str, mode: str =
     )
     if started is False:
         return await interaction.followup.send("🛑 Round preparation was cancelled.", ephemeral=True)
+    if isinstance(started, str):
+        return await interaction.followup.send(started, ephemeral=True)
     if not started:
-        return await interaction.followup.send("❌ Could not start the round; check that another round isn't loading.", ephemeral=True)
+        return await interaction.followup.send("❌ Could not start the round because no usable pet data was available.", ephemeral=True)
     await interaction.followup.send(
         "✅ Practice round started above. Automatic random spawns remain the rewarded rounds.", ephemeral=True
     )
