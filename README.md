@@ -8,7 +8,7 @@ This project has its own:
 
 - Discord application and token
 - GitHub repository and deployment history
-- Northflank service
+- Render service
 - PostgreSQL database
 - health endpoint and logs
 
@@ -87,17 +87,15 @@ git push -u origin main
 Check `git status` before pushing. `.env` files are ignored; `.env.example`
 contains names only.
 
-## 4. Deploy to Northflank
+## 4. Deploy to Render
 
-1. Create a Northflank project named **MCWV Games**.
-2. Choose **Create new → Service → Combined service**.
-3. Select the private `MCWV-GAMES` repository and `main` branch.
-4. Select **Dockerfile** as the build type.
-5. Keep one Sandbox/free instance.
-6. Northflank detects the Dockerfile's exposed HTTP port `10000`; make it public.
-7. Add an HTTP liveness check for `/health` on port `10000`.
-8. Add the runtime secrets below.
-9. Create the service and watch build/deployment logs.
+1. In a separate Render workspace, choose **New → Web Service**.
+2. Connect the private `MCWV-GAMES` repository and select `main`.
+3. Use the repository's Dockerfile runtime and the Free instance type while testing.
+4. Set the health-check path to `/health`.
+5. Add the runtime secrets below in Render's Environment settings.
+6. Create the service and inspect its build and runtime logs.
+7. Keep Auto-Deploy enabled only after private validation is complete.
 
 Required runtime variables:
 
@@ -132,12 +130,19 @@ Expected health response at `https://YOUR-SERVICE/health`:
   "status": "ok",
   "discord_ready": true,
   "database_ready": true,
+  "event_loop_lag_ms": 0.0,
   "guilds": 1
 }
 ```
 
-Northflank's always-on Sandbox does not need UptimeRobot to stay awake. Monitoring
-it is still useful for outage alerts.
+The health check now runs a bounded real `SELECT 1` and returns HTTP 503 while
+Discord or PostgreSQL is unavailable. Optional `DB_STATEMENT_TIMEOUT_MS` and
+`DB_LOCK_TIMEOUT_MS` variables may override the runtime defaults (1800ms and
+900ms); leave them unset unless troubleshooting with a database administrator.
+
+Render Free services may sleep after inactivity. An HTTP monitor such as
+UptimeRobot can check `/health` every five minutes during testing; a healthy
+response requires both Discord and PostgreSQL to be ready.
 
 ## 5. Test privately before cutover
 
@@ -150,7 +155,9 @@ it while public members cannot.
 4. Configure one private spawn channel.
 5. Test `/coins`, `/daily`, `/guess`, `/shop`, case role grants, duels, Tower,
    Trivia, Lottery, restarts, and `/health`.
-6. Confirm MCWV BOT's tickets, applications, clan commands, invites, giveaways,
+6. With a normal tester, verify three free hatches per rolling 24 hours, followed
+   by prepaid use or a 100-coin deduction for each extra hatch.
+7. Confirm MCWV BOT's tickets, applications, clan commands, invites, giveaways,
    Render service, and token are unchanged.
 
 ## 6. Safe cutover
@@ -171,9 +178,12 @@ confusion.
 ## Local validation
 
 ```bash
-python -m py_compile games_bot.py migrate_game_data.py
+python -m py_compile games_bot.py migrate_game_data.py test_standalone.py
+python -m pyflakes games_bot.py migrate_game_data.py test_standalone.py
+python test_standalone.py
 GUILD_ID=1501608673250640055 python -c \
   "import games_bot; print(len(games_bot.bot.tree.get_commands(guild=games_bot.guild_obj)))"
 ```
 
-The expected command count is `30`.
+The expected command count is `30`. The standalone suite also enforces early
+acknowledgement for all slash commands and every audited component/modal callback.
