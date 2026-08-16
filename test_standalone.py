@@ -6,7 +6,7 @@ from io import BytesIO
 
 os.environ.setdefault("GUILD_ID", "1501608673250640055")
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import games_bot as game
 
 
@@ -56,12 +56,26 @@ def test_guess_pure_logic_and_images():
     assert game.games_guess_is_catalogue_attempt(game.normalize_answer("Huge Happy Rocx"), valid, index)
     assert not game.games_guess_is_catalogue_attempt(game.normalize_answer("hello everyone"), valid, index)
 
+    # Full-frame artwork mirrors real API icons. Silhouette mode must remain
+    # visibly detailed rather than collapsing the opaque square to pure black.
     source = Image.new("RGBA", (96, 96), (20, 100, 220, 255))
+    draw = ImageDraw.Draw(source)
+    draw.ellipse((14, 10, 82, 84), fill=(245, 180, 60, 255))
+    draw.ellipse((27, 30, 39, 44), fill=(10, 12, 25, 255))
+    draw.ellipse((57, 30, 69, 44), fill=(10, 12, 25, 255))
+    draw.arc((34, 42, 62, 68), 10, 170, fill=(30, 20, 45, 255), width=4)
     raw = BytesIO()
     source.save(raw, "PNG")
     for mode in ("zoom", "silhouette", "pixel", "scrambled", "blur", "monochrome", "negative", "reveal"):
         output = game.games_build_round_image(raw.getvalue(), mode)
         assert output and output.getbuffer().nbytes > 50
+        if mode == "silhouette":
+            rendered = Image.open(output).convert("RGB")
+            colours = rendered.getcolors(maxcolors=rendered.width * rendered.height)
+            low, high = rendered.convert("L").getextrema()
+            assert colours is not None and len(colours) > 16
+            assert high - low >= 30
+            assert sum(count for count, rgb in colours if max(rgb) < 8) < rendered.width * rendered.height // 4
 
     for mode in game.GAMES_GUESS_MODE_INFO:
         round_info = {"rewarded": True, "mode": mode, "hint_step": 0, "pet_name": "Titanic Banana Cat"}
@@ -78,6 +92,12 @@ class Channel:
     async def send(self, *args, **kwargs):
         self.sent.append((args, kwargs))
         return type("Sent", (), {"id": len(self.sent)})()
+
+
+class DeniedChannel(Channel):
+    async def send(self, *args, **kwargs):
+        response = type("Response", (), {"status": 403, "reason": "Forbidden"})()
+        raise game.discord.Forbidden(response, {"code": 50013, "message": "Missing Permissions"})
 
 
 class Author:
@@ -99,6 +119,19 @@ class Message:
 
 
 async def _practice_and_clock_checks():
+    # Discord permission failures should produce an actionable staff response,
+    # not the misleading "another round is loading" message.
+    real_pool, real_asset = game.games_guess_pet_pool, game.games_pet_asset
+    game.games_guess_pet_pool = lambda: ["Huge Test Pet"]
+    game.games_pet_asset = lambda _name: None
+    permission_error = await game.games_start_guess_round(
+        DeniedChannel(900), pet_key="Huge Test Pet", mode="letters", rewarded=False,
+    )
+    game.games_guess_pet_pool, game.games_pet_asset = real_pool, real_asset
+    assert isinstance(permission_error, str)
+    assert "Send Messages" in permission_error and "Attach Files" in permission_error
+    assert 900 not in game.ACTIVE_GUESS_STARTING
+
     pool = ["Huge Cosmic Agony", "Huge Happy Rock", "Titanic Banana Cat"]
     valid = {game.normalize_answer(name) for name in pool}
     valid.update(game.normalize_answer(game.games_guess_short_name(name)) for name in pool)
