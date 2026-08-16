@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import os
 from io import BytesIO
 
@@ -17,6 +19,25 @@ def test_registration_and_health():
     response = game.app.test_client().get("/health")
     assert response.status_code == 200
     assert response.get_json()["service"] == "MCWV Games"
+
+
+def test_connection_errors_do_not_log_secrets():
+    secret = "do-not-print-this-password"
+    original = game._connect_database
+
+    def fail_with_secret():
+        raise game.psycopg2.ProgrammingError(f"invalid DSN token: {secret}")
+
+    game._connect_database = fail_with_secret
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            assert game.ensure_db_connection() is None
+    finally:
+        game._connect_database = original
+    logged = output.getvalue()
+    assert "ProgrammingError" in logged
+    assert secret not in logged
 
 
 def test_guess_pure_logic_and_images():
@@ -146,6 +167,7 @@ def test_async_lifecycle():
 
 if __name__ == "__main__":
     test_registration_and_health()
+    test_connection_errors_do_not_log_secrets()
     test_guess_pure_logic_and_images()
     test_async_lifecycle()
     print("standalone checks passed")
