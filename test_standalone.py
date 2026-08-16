@@ -1,8 +1,10 @@
+import ast
 import asyncio
 import contextlib
 import io
 import os
 from io import BytesIO
+from pathlib import Path
 
 os.environ.setdefault("GUILD_ID", "1501608673250640055")
 
@@ -16,9 +18,27 @@ def test_registration_and_health():
     assert len(commands) == 30
     assert {"games", "guess", "shop", "caseadmin", "gamesadmin"} <= names
     assert not ({"ticket", "giveaway", "warinfo", "add", "invite"} & names)
-    response = game.app.test_client().get("/health")
+    original_probe = game.games_database_probe
+    original_ready = game.bot.is_ready
+    game.games_database_probe = lambda: True
+    game.bot.is_ready = lambda: True
+    try:
+        response = game.app.test_client().get("/health")
+    finally:
+        game.games_database_probe = original_probe
+        game.bot.is_ready = original_ready
     assert response.status_code == 200
     assert response.get_json()["service"] == "MCWV Games"
+
+    game.games_database_probe = lambda: False
+    game.bot.is_ready = lambda: True
+    try:
+        degraded = game.app.test_client().get("/health")
+    finally:
+        game.games_database_probe = original_probe
+        game.bot.is_ready = original_ready
+    assert degraded.status_code == 503
+    assert degraded.get_json()["status"] == "degraded"
 
 
 def test_connection_errors_do_not_log_secrets():
@@ -198,9 +218,133 @@ def test_async_lifecycle():
     asyncio.run(_practice_and_clock_checks())
 
 
+def test_every_slash_command_defers_first():
+    """Regression guard for Discord's initial interaction deadline."""
+    tree = ast.parse(Path(game.__file__).read_text(encoding="utf-8"))
+    checked = []
+    for function in (node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)):
+        is_command = any(
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "command"
+            for decorator in function.decorator_list
+        )
+        if not is_command:
+            continue
+        first = function.body[0]
+        assert isinstance(first, ast.Expr) and isinstance(first.value, ast.Await), function.name
+        call = first.value.value
+        assert isinstance(call, ast.Call), function.name
+        assert isinstance(call.func, ast.Attribute) and call.func.attr == "defer", function.name
+        checked.append(function.name)
+    assert len(checked) == 30
+
+    autocomplete_names = {
+        "games_case_autocomplete",
+        "games_guess_pet_autocomplete",
+        "games_egg_autocomplete",
+    }
+    found = set()
+    for function in (node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef)):
+        if function.name not in autocomplete_names:
+            continue
+        found.add(function.name)
+        calls = {
+            node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+            for node in ast.walk(function) if isinstance(node, ast.Call)
+        }
+        assert not any(name.startswith("db_") or name in {"cursor", "execute"} for name in calls)
+    assert found == autocomplete_names
+
+    def dotted(node):
+        if isinstance(node, ast.Call):
+            return dotted(node.func)
+        if isinstance(node, ast.Attribute):
+            base = dotted(node.value)
+            return f"{base}.{node.attr}" if base else node.attr
+        if isinstance(node, ast.Name):
+            return node.id
+        return ""
+
+    acknowledgement_names = {
+        "interaction.response.defer",
+        "interaction.response.send_message",
+        "interaction.response.edit_message",
+        "interaction.response.send_modal",
+    }
+    dangerous_fragments = ("db_", "conn.cursor", ".fetch_", ".create_invite")
+    callbacks = []
+    for class_node in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+        methods = {
+            node.name: node for node in class_node.body if isinstance(node, ast.AsyncFunctionDef)
+        }
+        for function in methods.values():
+            is_button = any(
+                isinstance(decorator, ast.Call) and dotted(decorator.func).endswith("discord.ui.button")
+                for decorator in function.decorator_list
+            )
+            if function.name not in {"callback", "on_submit"} and not is_button:
+                continue
+            callbacks.append(f"{class_node.name}.{function.name}")
+            ack_lines = [
+                node.lineno for node in ast.walk(function)
+                if isinstance(node, ast.Await)
+                and isinstance(node.value, ast.Call)
+                and dotted(node.value.func) in acknowledgement_names
+            ]
+            ack_line = min(ack_lines) if ack_lines else None
+            if ack_line is None:
+                delegated = sorted(
+                    (
+                        node.lineno,
+                        dotted(node.value.func).removeprefix("self."),
+                    )
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.Await)
+                    and isinstance(node.value, ast.Call)
+                    and dotted(node.value.func).startswith("self.")
+                )
+                assert delegated, f"{class_node.name}.{function.name}"
+                def helper_has_ack(helper_name, seen=None):
+                    seen = set(seen or ())
+                    if helper_name in seen:
+                        return False
+                    seen.add(helper_name)
+                    helper = methods.get(helper_name)
+                    if helper is None:
+                        return False
+                    if any(
+                        isinstance(node, ast.Await)
+                        and isinstance(node.value, ast.Call)
+                        and dotted(node.value.func) in acknowledgement_names
+                        for node in ast.walk(helper)
+                    ):
+                        return True
+                    nested = sorted(
+                        (node.lineno, dotted(node.value.func).removeprefix("self."))
+                        for node in ast.walk(helper)
+                        if isinstance(node, ast.Await)
+                        and isinstance(node.value, ast.Call)
+                        and dotted(node.value.func).startswith("self.")
+                    )
+                    return bool(nested) and helper_has_ack(nested[0][1], seen)
+
+                assert helper_has_ack(delegated[0][1]), f"{class_node.name}.{function.name}"
+            else:
+                for node in ast.walk(function):
+                    if not isinstance(node, ast.Call) or node.lineno >= ack_line:
+                        continue
+                    name = dotted(node)
+                    assert not any(fragment in name for fragment in dangerous_fragments), (
+                        class_node.name, function.name, node.lineno, name
+                    )
+    assert len(callbacks) == 44
+
+
 if __name__ == "__main__":
     test_registration_and_health()
     test_connection_errors_do_not_log_secrets()
     test_guess_pure_logic_and_images()
     test_async_lifecycle()
+    test_every_slash_command_defers_first()
     print("standalone checks passed")
