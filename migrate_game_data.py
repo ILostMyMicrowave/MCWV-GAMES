@@ -188,5 +188,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"Migration failed and was rolled back: {type(exc).__name__}: {exc}", file=sys.stderr)
+        # psycopg2 can include malformed DSN tokens (including passwords) in
+        # parser errors, so never echo raw exception text from this credentialed tool.
+        print(f"Migration failed and was rolled back: {type(exc).__name__}", file=sys.stderr)
         raise
