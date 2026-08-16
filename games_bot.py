@@ -58,6 +58,8 @@ class MCWVGamesBot(commands.Bot):
     async def close(self):
         if "games_housekeeping_loop" in globals() and games_housekeeping_loop.is_running():
             games_housekeeping_loop.cancel()
+        if "games_event_loop_watchdog" in globals() and games_event_loop_watchdog.is_running():
+            games_event_loop_watchdog.cancel()
         if session is not None and not session.closed:
             await session.close()
         if conn is not None and conn.closed == 0:
@@ -71,6 +73,38 @@ conn = None
 session = None
 _db_lock = threading.RLock()
 
+# Keep a stalled PostgreSQL statement below Discord's interaction deadline.
+# Commands still defer before DB work; this limit also prevents one query from
+# freezing the shared Discord event loop indefinitely.
+DB_STATEMENT_TIMEOUT_MS = max(250, int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "1800")))
+DB_LOCK_TIMEOUT_MS = max(100, int(os.environ.get("DB_LOCK_TIMEOUT_MS", "900")))
+DB_CONNECTION_OPTIONS = (
+    f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS} "
+    f"-c lock_timeout={DB_LOCK_TIMEOUT_MS} "
+    "-c idle_in_transaction_session_timeout=10000"
+)
+DB_WORKER_CONNECTION_OPTIONS = (
+    "-c statement_timeout=30000 -c lock_timeout=5000 "
+    "-c idle_in_transaction_session_timeout=30000"
+)
+_database_initializing = True
+
+# Database-backed settings are read frequently by gates and component checks.
+# A short cache removes PostgreSQL I/O from the acknowledgement path.
+_DB_SETTING_CACHE_TTL = max(5.0, float(os.environ.get("DB_SETTING_CACHE_TTL", "30")))
+_db_setting_cache = {}
+_db_setting_cache_lock = threading.RLock()
+
+# Autocomplete callbacks cannot be deferred. They therefore read only these
+# preloaded snapshots and never query PostgreSQL on a keystroke.
+_games_interaction_cache_lock = threading.RLock()
+_games_case_choices_cache = []
+_games_case_catalog_cache = []
+_games_pet_choices_cache = []
+_games_egg_choices_cache = []
+_games_tester_cache = {}
+_GAMES_TESTER_CACHE_TTL = 30.0
+
 
 def _connect_database():
     global conn
@@ -83,6 +117,7 @@ def _connect_database():
             DATABASE_URL,
             sslmode=os.environ.get("DB_SSLMODE", "require"),
             connect_timeout=8,
+            options=DB_WORKER_CONNECTION_OPTIONS if _database_initializing else DB_CONNECTION_OPTIONS,
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -145,31 +180,49 @@ def init_base_schema():
 
 
 def db_get_setting(key, default=None):
+    cache_key = str(key)
+    now = time.monotonic()
+    with _db_setting_cache_lock:
+        cached = _db_setting_cache.get(cache_key)
+        if cached:
+            # Stale-while-running is intentional: Discord callbacks must never
+            # hit PostgreSQL before acknowledging. Bot setting writes update
+            # this cache immediately.
+            return cached[1]
     if not db_enabled():
+        with _db_setting_cache_lock:
+            _db_setting_cache[cache_key] = (now + _DB_SETTING_CACHE_TTL, default)
         return default
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT value FROM settings WHERE key = %s", (str(key),))
+            cur.execute("SELECT value FROM settings WHERE key = %s", (cache_key,))
             row = cur.fetchone()
-        return row[0] if row else default
+        value = row[0] if row else default
+        with _db_setting_cache_lock:
+            _db_setting_cache[cache_key] = (now + _DB_SETTING_CACHE_TTL, value)
+        return value
     except Exception as exc:
-        print(f"[database] setting read failed: {exc}")
+        print(f"[database] setting read failed: {type(exc).__name__}")
         return default
 
 
 def db_set_setting(key, value):
     if not db_enabled():
         return False
+    cache_key = str(key)
+    cache_value = str(value)
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO settings (key, value) VALUES (%s, %s)
                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
-                (str(key), str(value)),
+                (cache_key, cache_value),
             )
+        with _db_setting_cache_lock:
+            _db_setting_cache[cache_key] = (time.monotonic() + _DB_SETTING_CACHE_TTL, cache_value)
         return True
     except Exception as exc:
-        print(f"[database] setting write failed: {exc}")
+        print(f"[database] setting write failed: {type(exc).__name__}")
         return False
 
 
@@ -191,6 +244,7 @@ def _readonly_connection():
             MCWV_READONLY_DATABASE_URL,
             sslmode=os.environ.get("DB_SSLMODE", "require"),
             connect_timeout=5,
+            options="-c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000",
         )
     except Exception as exc:
         # Never echo a connection exception: malformed DSNs can contain the password.
@@ -265,16 +319,47 @@ async def get_active_battle_id_for_placement():
 app = Flask(__name__)
 
 
+def games_database_probe():
+    """Real bounded SELECT 1 probe, always on the Flask worker thread."""
+    worker = None
+    try:
+        if not DATABASE_URL:
+            return False
+        worker = psycopg2.connect(
+            DATABASE_URL,
+            sslmode=os.environ.get("DB_SSLMODE", "require"),
+            connect_timeout=4,
+            options="-c statement_timeout=1500 -c lock_timeout=750",
+        )
+        worker.autocommit = True
+        with worker.cursor() as cur:
+            cur.execute("SELECT 1")
+            row = cur.fetchone()
+        return bool(row and row[0] == 1)
+    except Exception:
+        return False
+    finally:
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+
+
 @app.get("/")
 @app.get("/health")
 def health():
+    database_ready = games_database_probe()
+    discord_ready = bool(bot.is_ready())
+    healthy = database_ready and discord_ready
     return jsonify({
         "service": APP_NAME,
-        "status": "ok",
-        "discord_ready": bool(bot.is_ready()),
-        "database_ready": db_enabled(),
+        "status": "ok" if healthy else "degraded",
+        "discord_ready": discord_ready,
+        "database_ready": database_ready,
+        "event_loop_lag_ms": round(float(globals().get("_games_event_loop_lag", 0.0)) * 1000, 1),
         "guilds": len(bot.guilds),
-    }), 200
+    }), 200 if healthy else 503
 
 
 def run_health_server():
@@ -660,35 +745,14 @@ def games_shop_items(user_id):
 
 
 def games_case_catalog(enabled_only=True, limit=15):
-    """Case definitions + role odds for the shop and staff dashboard."""
-    if not db_enabled():
-        return []
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT id, name, price, emoji, enabled
-                   FROM mcwv_cases
-                   WHERE (%s = FALSE OR enabled = TRUE)
-                   ORDER BY enabled DESC, price ASC, LOWER(name) ASC
-                   LIMIT %s""",
-                (bool(enabled_only), max(1, min(int(limit), 100))),
-            )
-            cases = cur.fetchall()
-            out = []
-            for cid, name, price, emoji, enabled in cases:
-                cur.execute(
-                    "SELECT role_id, chance FROM mcwv_case_contents WHERE case_id = %s ORDER BY chance DESC, role_id",
-                    (int(cid),),
-                )
-                contents = [(int(rid), float(chance)) for rid, chance in cur.fetchall()]
-                out.append({
-                    "id": int(cid), "name": str(name), "price": int(price),
-                    "emoji": str(emoji or "🎁"), "enabled": bool(enabled), "contents": contents,
-                })
-            return out
-    except Exception as exc:
-        print(f"[games] case catalog failed: {exc}")
-        return []
+    """Cached case definitions + role odds for interaction-safe UI rendering."""
+    with _games_interaction_cache_lock:
+        catalog = [
+            {**case, "contents": list(case.get("contents") or [])}
+            for case in _games_case_catalog_cache
+            if not enabled_only or case.get("enabled")
+        ]
+    return catalog[:max(1, min(int(limit), 100))]
 
 
 def games_shop_embed(user_id, page=0):
@@ -972,6 +1036,11 @@ def games_set_staff_role_ids(role_ids):
                        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
                     (GAMES_SETTING_STAFF_ROLES, json.dumps(ids)),
                 )
+        with _db_setting_cache_lock:
+            _db_setting_cache[GAMES_SETTING_STAFF_ROLES] = (
+                time.monotonic() + _DB_SETTING_CACHE_TTL,
+                json.dumps(ids),
+            )
         return True, ids
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -993,14 +1062,21 @@ def games_case_staff_check(member):
 
 
 def games_is_tester(user_id):
+    uid = int(user_id)
+    now = time.monotonic()
+    cached = _games_tester_cache.get(uid)
+    if cached and cached[0] > now:
+        return cached[1]
     try:
         if not db_enabled():
             return False
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM mcwv_game_testers WHERE discord_id = %s", (int(user_id),))
-            return cur.fetchone() is not None
+            cur.execute("SELECT 1 FROM mcwv_game_testers WHERE discord_id = %s", (uid,))
+            allowed = cur.fetchone() is not None
+        _games_tester_cache[uid] = (now + _GAMES_TESTER_CACHE_TTL, allowed)
+        return allowed
     except Exception as exc:
-        print(f"[games] tester check failed: {exc}")
+        print(f"[games] tester check failed: {type(exc).__name__}")
         return False
 
 
@@ -1055,6 +1131,7 @@ def games_new_db_connection():
         DATABASE_URL,
         sslmode=os.environ.get("DB_SSLMODE", "require"),
         connect_timeout=5,
+        options=DB_WORKER_CONNECTION_OPTIONS,
         keepalives=1,
         keepalives_idle=30,
         keepalives_interval=10,
@@ -1062,6 +1139,69 @@ def games_new_db_connection():
     )
     c.autocommit = True
     return c
+
+
+def games_refresh_interaction_caches_sync():
+    """Refresh DB-backed UI/autocomplete snapshots on a worker connection."""
+    global _games_case_choices_cache, _games_case_catalog_cache
+    global _games_pet_choices_cache, _games_egg_choices_cache
+    worker = None
+    try:
+        worker = games_new_db_connection()
+        if worker is None:
+            return False
+        with worker.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, price, emoji, enabled FROM mcwv_cases "
+                "ORDER BY enabled DESC, price ASC, LOWER(name) LIMIT 100"
+            )
+            case_rows = cur.fetchall()
+            cur.execute(
+                "SELECT case_id, role_id, chance FROM mcwv_case_contents "
+                "ORDER BY case_id, chance DESC, role_id"
+            )
+            contents_by_case = {}
+            for case_id, role_id, chance in cur.fetchall():
+                contents_by_case.setdefault(int(case_id), []).append((int(role_id), float(chance)))
+            catalog = [
+                {
+                    "id": int(case_id), "name": str(name), "price": int(price or 0),
+                    "emoji": str(emoji or "🎁"), "enabled": bool(enabled),
+                    "contents": contents_by_case.get(int(case_id), []),
+                }
+                for case_id, name, price, emoji, enabled in case_rows
+            ]
+            cases = [
+                {"name": case["name"], "price": case["price"], "emoji": case["emoji"]}
+                for case in catalog if case["enabled"]
+            ]
+            cur.execute(
+                "SELECT name FROM mcwv_game_pets "
+                "WHERE category ILIKE 'Huge%' OR category ILIKE 'Titanic%' OR category ILIKE 'Gargantuan%' "
+                "ORDER BY LOWER(name) LIMIT 1000"
+            )
+            pets = [str(row[0]) for row in cur.fetchall()]
+            cur.execute("SELECT name FROM mcwv_game_eggs ORDER BY LOWER(name) LIMIT 500")
+            eggs = [str(row[0]) for row in cur.fetchall()]
+        with _games_interaction_cache_lock:
+            _games_case_choices_cache = cases
+            _games_case_catalog_cache = catalog
+            _games_pet_choices_cache = pets
+            _games_egg_choices_cache = eggs
+        return True
+    except Exception as exc:
+        print(f"[games] interaction cache refresh failed: {type(exc).__name__}")
+        return False
+    finally:
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+
+
+async def games_refresh_interaction_caches():
+    return await asyncio.to_thread(games_refresh_interaction_caches_sync)
 
 
 def games_cooldown_claim(subject_id, game, seconds):
@@ -1828,9 +1968,9 @@ def init_games_tables():
 @bot.tree.command(name="coins", description="Check your (or someone's) coin balance", guild=guild_obj)
 @app_commands.describe(user="Whose balance to check")
 async def games_coins(interaction: discord.Interaction, user: discord.User = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     target = user or interaction.user
     embed = games_wallet_embed(target)
     view = CoinsQuickView(interaction.user.id)
@@ -1839,9 +1979,9 @@ async def games_coins(interaction: discord.Interaction, user: discord.User = Non
 
 @bot.tree.command(name="daily", description="Daily check-in — 100 coins + 10 per streak day", guild=guild_obj)
 async def games_daily(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     uid = interaction.user.id
     now = datetime.now(timezone.utc)
     try:
@@ -1932,9 +2072,9 @@ async def games_daily(interaction: discord.Interaction):
 @bot.tree.command(name="pay", description="Send coins to another member", guild=guild_obj)
 @app_commands.describe(user="Who to pay", amount="Amount (min 10)")
 async def games_pay(interaction: discord.Interaction, user: discord.User, amount: int):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     amount = int(amount)
     if amount < GAMES_PAY_MIN:
         return await interaction.followup.send(f"❌ Minimum transfer is **{GAMES_PAY_MIN}** coins.", ephemeral=True)
@@ -1955,9 +2095,9 @@ async def games_pay(interaction: discord.Interaction, user: discord.User, amount
 @bot.tree.command(name="deposit", description="Move cash into your bank (earns daily interest)", guild=guild_obj)
 @app_commands.describe(amount="Amount to deposit, or 'all'")
 async def games_deposit(interaction: discord.Interaction, amount: str):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     uid = interaction.user.id
     bal = games_coin_balance(uid)
     try:
@@ -1979,9 +2119,9 @@ async def games_deposit(interaction: discord.Interaction, amount: str):
 @bot.tree.command(name="withdraw", description="Move banked coins back to cash", guild=guild_obj)
 @app_commands.describe(amount="Amount to withdraw, or 'all'")
 async def games_withdraw(interaction: discord.Interaction, amount: str):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     uid = interaction.user.id
     bal = games_coin_balance(uid)
     try:
@@ -2230,9 +2370,9 @@ class ShopView(discord.ui.View):
 
 @bot.tree.command(name="shop", description="Buy game items with coins", guild=guild_obj)
 async def games_shop(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     view = ShopView()
     view._set_owner(interaction.user.id)
     view.message = await interaction.followup.send(
@@ -2244,9 +2384,9 @@ async def games_shop(interaction: discord.Interaction):
 
 @bot.tree.command(name="cases", description="Browse available role cases", guild=guild_obj)
 async def games_cases(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM mcwv_cases WHERE enabled = TRUE")
@@ -2405,7 +2545,8 @@ class CaseConfirmView(discord.ui.View):
 
 async def games_case_autocomplete(interaction: discord.Interaction, current: str):
     cur = str(current or "").strip().lower()
-    cases = games_case_catalog(enabled_only=True, limit=25)
+    with _games_interaction_cache_lock:
+        cases = list(_games_case_choices_cache)
     return [
         app_commands.Choice(name=f"{case['emoji']} {case['name']} — {case['price']:,} credits"[:100], value=case["name"])
         for case in cases if not cur or cur in case["name"].lower()
@@ -2416,9 +2557,9 @@ async def games_case_autocomplete(interaction: discord.Interaction, current: str
 @app_commands.describe(name="Case name")
 @app_commands.autocomplete(name=games_case_autocomplete)
 async def games_case_open(interaction: discord.Interaction, name: str):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id, name, price, emoji FROM mcwv_cases WHERE enabled = TRUE AND LOWER(name) = LOWER(%s)", (name.strip(),))
@@ -2496,9 +2637,9 @@ async def games_case_open(interaction: discord.Interaction, name: str):
     app_commands.Choice(name="audit", value="audit"),
 ])
 async def coins_admin(interaction: discord.Interaction, action: str, user: discord.User = None, amount: int = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if not games_owner_check(interaction.user):
         return await interaction.followup.send("❌ Owner only.", ephemeral=True)
 
@@ -3250,7 +3391,11 @@ async def games_handle_answer(message):
 
 async def games_guess_pet_autocomplete(interaction: discord.Interaction, current: str):
     current = normalize_answer(current)
-    matches = [name for name in games_guess_pet_pool() if not current or current in normalize_answer(name)]
+    with _games_interaction_cache_lock:
+        pool = list(_games_pet_choices_cache)
+    if not pool:
+        pool = list(GAMES_PET_SEED.keys())
+    matches = [name for name in pool if not current or current in normalize_answer(name)]
     return [app_commands.Choice(name=name[:100], value=name) for name in matches[:25]]
 
 
@@ -3278,9 +3423,9 @@ async def games_guess_pet_autocomplete(interaction: discord.Interaction, current
 ])
 @app_commands.autocomplete(pet=games_guess_pet_autocomplete)
 async def games_guess(interaction: discord.Interaction, action: str, mode: str = "random", pet: str = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
 
     if action == "stats":
         profile = games_guess_profile(interaction.user.id)
@@ -3387,9 +3532,9 @@ async def games_guess(interaction: discord.Interaction, action: str, mode: str =
 @bot.tree.command(name="pets", description="Your hatched pet collection", guild=guild_obj)
 @app_commands.describe(user="Whose collection to view")
 async def games_pets(interaction: discord.Interaction, user: discord.User = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     target = user or interaction.user
     try:
         with conn.cursor() as cur:
@@ -3897,9 +4042,9 @@ async def settle_duel(duel_id, winner_id, reason):
 @bot.tree.command(name="duel", description="Challenge someone to a live 1v1 for a coin wager", guild=guild_obj)
 @app_commands.describe(user="Who to challenge", wager="Coins on the line")
 async def games_duel(interaction: discord.Interaction, user: discord.User, wager: int):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer()
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     wager = int(wager)
     if wager < GAMES_DUEL_MIN_WAGER:
         return await interaction.followup.send(f"❌ Minimum wager is **{GAMES_DUEL_MIN_WAGER}** coins.", ephemeral=True)
@@ -3959,9 +4104,9 @@ async def games_duel(interaction: discord.Interaction, user: discord.User, wager
 
 @bot.tree.command(name="scramble", description="Unscramble a pet name — first correct wins 100 coins", guild=guild_obj)
 async def games_scramble(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer()
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.channel.id in ACTIVE_SCRAMBLE:
         return await interaction.followup.send("❌ A scramble is already active in this channel.", ephemeral=True)
     allowed, retry_at = (True, None) if games_is_unlimited(interaction.user.id) else games_cooldown_claim(
@@ -4029,9 +4174,9 @@ async def games_handle_scramble(message):
 
 @bot.tree.command(name="hangman", description="Hangman with pet names — 6 lives", guild=guild_obj)
 async def games_hangman(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer()
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.channel.id in ACTIVE_HANGMAN:
         return await interaction.followup.send("❌ A hangman game is already active here.", ephemeral=True)
     allowed, retry_at = (True, None) if games_is_unlimited(interaction.user.id) else games_cooldown_claim(
@@ -4280,9 +4425,9 @@ def games_petdle_board(guesses, target):
 @bot.tree.command(name="petdle", description="Daily pet-name Wordle — six guesses", guild=guild_obj)
 @app_commands.describe(guess="Your guess")
 async def games_petdle(interaction: discord.Interaction, guess: str = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     target = games_petdle_target()
     target_core = normalize_answer(target)
 
@@ -4614,9 +4759,9 @@ def games_build_wheel_image(win_idx):
 
 @bot.tree.command(name="spin", description="Spin the wheel once a day — progressive jackpot!", guild=guild_obj)
 async def games_spin(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer()
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     free, spins = games_free_use(interaction.user.id, "spin")
     if not free:
         if not games_prepaid_consume(interaction.user.id, "spin"):
@@ -4733,9 +4878,9 @@ def games_scratch_apply_pity(user_id, picks):
 
 @bot.tree.command(name="scratch", description="Scratch 3 pets — daily free, match for prizes", guild=guild_obj)
 async def games_scratch(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer()
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     # 1 free daily (atomic 24h window)
     free, used = games_free_use(interaction.user.id, "scratch")
     if not free:
@@ -4861,9 +5006,9 @@ GAMES_BINGO_EVENTS = [
 
 @bot.tree.command(name="bingo", description="War Bingo — free card, auto-marked live during wars", guild=guild_obj)
 async def games_bingo(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     battle_id = await get_active_battle_id_for_placement()
     if not battle_id:
         st = get_battles_war_state()
@@ -5246,8 +5391,9 @@ class GamesGuideSelect(discord.ui.Select):
 
 @bot.tree.command(name="gamesguide", description="Learn how the games and economy work", guild=guild_obj)
 async def games_guide(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     view = discord.ui.View(timeout=300)
     view.add_item(GamesGuideSelect())
     embed = discord.Embed(
@@ -5255,7 +5401,7 @@ async def games_guide(interaction: discord.Interaction):
         description="Pick a topic below to learn how everything works.",
         color=discord.Color.from_rgb(108, 34, 245),
     )
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 # ---------------- GAMES HOUSEKEEPING LOOP ----------------
@@ -5306,20 +5452,24 @@ async def games_housekeeping_loop():
             if (duel.get("state") == "active" and duel.get("round_started")
                     and now - float(duel["round_started"]) >= GAMES_DUEL_TIMEOUT):
                 await settle_duel(duel_id, None, "timeout")
-        # expire stale pending duels (DB + memory)
+        # Expire stale pending duels on a worker connection so housekeeping can
+        # never freeze Discord's interaction loop.
         try:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE mcwv_duels SET state = 'expired' WHERE state = 'pending' AND created_at < NOW() - INTERVAL '5 minutes' RETURNING id")
-                expired = [int(r[0]) for r in cur.fetchall()]
-            conn.commit()
+            def _expire_pending_duels():
+                worker = games_new_db_connection()
+                if worker is None:
+                    return []
+                try:
+                    with worker.cursor() as cur:
+                        cur.execute("UPDATE mcwv_duels SET state = 'expired' WHERE state = 'pending' AND created_at < NOW() - INTERVAL '5 minutes' RETURNING id")
+                        return [int(row[0]) for row in cur.fetchall()]
+                finally:
+                    worker.close()
+            expired = await asyncio.to_thread(_expire_pending_duels)
             for duel_id in expired:
                 ACTIVE_DUELS.pop(duel_id, None)
         except Exception as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            print(f"[games] duel expiry failed: {exc}")
+            print(f"[games] duel expiry failed: {type(exc).__name__}")
         # Trivia sessions self-advance on question timeout; this is a final leak guard.
         for uid, s in list(ACTIVE_TRIVIA.items()):
             if now - float(s.get("last_activity", s.get("started", now))) > 10 * 60:
@@ -5427,6 +5577,8 @@ async def games_housekeeping_loop():
                 # Draw even without an announcement channel; never mark it done first.
                 await games_lottery_draw(ch)
                 db_set_setting("games_lottery_last_draw_week", draw_key)
+        # Autocomplete callbacks consume only this worker-refreshed snapshot.
+        await games_refresh_interaction_caches()
     except Exception as exc:
         print(f"[games] housekeeping error: {exc}")
 
@@ -5769,6 +5921,7 @@ class CreateCaseModal(discord.ui.Modal, title="Create a role case"):
                 f"❌ Use a name and a price between 10 and {GAMES_MAX_TRANSACTION:,} credits.", ephemeral=True
             )
         use_emoji = str(self.emoji).strip() if games_emoji_ok(str(self.emoji)) else "🎁"
+        await interaction.response.defer(ephemeral=True)
         try:
             duplicate = False
             with conn.cursor() as cur:
@@ -5781,8 +5934,9 @@ class CreateCaseModal(discord.ui.Modal, title="Create a role case"):
                     )
             conn.commit()
             if duplicate:
-                return await interaction.response.send_message("❌ A case with that name already exists.", ephemeral=True)
-            await interaction.response.send_message(
+                return await interaction.followup.send("❌ A case with that name already exists.", ephemeral=True)
+            await games_refresh_interaction_caches()
+            await interaction.followup.send(
                 f"✅ Created {use_emoji} **{name}** for **{price:,} credits**. Press **Refresh** on the manager, select it, then add prizes.",
                 ephemeral=True,
             )
@@ -5791,7 +5945,7 @@ class CreateCaseModal(discord.ui.Modal, title="Create a role case"):
                 conn.rollback()
             except Exception:
                 pass
-            await interaction.response.send_message(f"❌ Create failed: `{type(exc).__name__}`", ephemeral=True)
+            await interaction.followup.send(f"❌ Create failed: `{type(exc).__name__}`", ephemeral=True)
 
 
 class EditCaseModal(discord.ui.Modal, title="Edit case details"):
@@ -5816,6 +5970,7 @@ class EditCaseModal(discord.ui.Modal, title="Edit case details"):
         if price < 10 or price > GAMES_MAX_TRANSACTION:
             return await interaction.response.send_message("❌ Invalid price.", ephemeral=True)
         use_emoji = str(self.emoji).strip() if games_emoji_ok(str(self.emoji)) else "🎁"
+        await interaction.response.defer(ephemeral=True)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -5825,13 +5980,14 @@ class EditCaseModal(discord.ui.Modal, title="Edit case details"):
                 row = cur.fetchone()
             conn.commit()
             if not row:
-                return await interaction.response.send_message("❌ That case no longer exists.", ephemeral=True)
-            await interaction.response.send_message(
+                return await interaction.followup.send("❌ That case no longer exists.", ephemeral=True)
+            await games_refresh_interaction_caches()
+            await interaction.followup.send(
                 f"✅ Updated {use_emoji} **{self.case_name}** to **{price:,} credits**. Press **Refresh** on the manager.",
                 ephemeral=True,
             )
         except Exception as exc:
-            await interaction.response.send_message(f"❌ Edit failed: `{type(exc).__name__}`", ephemeral=True)
+            await interaction.followup.send(f"❌ Edit failed: `{type(exc).__name__}`", ephemeral=True)
 
 
 class AddCasePrizeChanceModal(discord.ui.Modal, title="Set prize chance"):
@@ -5857,6 +6013,7 @@ class AddCasePrizeChanceModal(discord.ui.Modal, title="Set prize chance"):
         role_error = games_case_reward_role_error(interaction.guild, role)
         if role_error:
             return await interaction.response.send_message(f"❌ {role_error}", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
         try:
             error = None
             case_name = None
@@ -5887,14 +6044,15 @@ class AddCasePrizeChanceModal(discord.ui.Modal, title="Set prize chance"):
                                 ON CONFLICT (case_id, role_id) DO UPDATE SET chance = EXCLUDED.chance
                             """, (self.case_id, self.role_id, chance))
             if error:
-                return await interaction.response.send_message(f"❌ {error}", ephemeral=True)
-            await interaction.response.send_message(
+                return await interaction.followup.send(f"❌ {error}", ephemeral=True)
+            await games_refresh_interaction_caches()
+            await interaction.followup.send(
                 f"✅ Set <@&{self.role_id}> to **{chance:.2f}%** in **{case_name}**. "
                 f"Configured total: **{new_total:.2f}%**. Press **Refresh** on the manager.",
                 ephemeral=True,
             )
         except Exception as exc:
-            await interaction.response.send_message(f"❌ Prize update failed: `{type(exc).__name__}`", ephemeral=True)
+            await interaction.followup.send(f"❌ Prize update failed: `{type(exc).__name__}`", ephemeral=True)
 
 
 class CasePrizeRoleSelect(discord.ui.RoleSelect):
@@ -5945,6 +6103,7 @@ class RemoveCasePrizeSelect(discord.ui.Select):
         if not isinstance(view, RemoveCasePrizeView):
             return await interaction.response.send_message("This picker expired.", ephemeral=True)
         role_id = int(self.values[0])
+        await interaction.response.defer(ephemeral=True)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -5953,14 +6112,15 @@ class RemoveCasePrizeSelect(discord.ui.Select):
                 )
                 row = cur.fetchone()
             conn.commit()
-            await interaction.response.send_message(
+            await games_refresh_interaction_caches()
+            await interaction.followup.send(
                 f"✅ Removed <@&{role_id}> from **{view.case_name}**." if row else "❌ Prize not found.",
                 ephemeral=True,
             )
             self.disabled = True
             view.stop()
         except Exception as exc:
-            await interaction.response.send_message(f"❌ Remove failed: `{type(exc).__name__}`", ephemeral=True)
+            await interaction.followup.send(f"❌ Remove failed: `{type(exc).__name__}`", ephemeral=True)
 
 
 class RemoveCasePrizeView(discord.ui.View):
@@ -5993,17 +6153,22 @@ class DeleteCaseConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Delete permanently", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s", (self.case_id,))
-                cur.execute("DELETE FROM mcwv_cases WHERE id = %s RETURNING id", (self.case_id,))
-                deleted = cur.fetchone()
-        self.stop()
-        await interaction.response.edit_message(
-            content=f"✅ Deleted **{self.case_name}**." if deleted else "❌ Case not found.",
-            embed=None,
-            view=None,
-        )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s", (self.case_id,))
+                    cur.execute("DELETE FROM mcwv_cases WHERE id = %s RETURNING id", (self.case_id,))
+                    deleted = cur.fetchone()
+            self.stop()
+            await games_refresh_interaction_caches()
+            await interaction.edit_original_response(
+                content=f"✅ Deleted **{self.case_name}**." if deleted else "❌ Case not found.",
+                embed=None,
+                view=None,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Delete failed: `{type(exc).__name__}`", ephemeral=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -6046,10 +6211,12 @@ class CaseAdminPanelView(discord.ui.View):
         return True
 
     async def refresh_message(self, interaction, notice=None):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         new_view = CaseAdminPanelView(self.staff_id, self.selected_case_id)
         new_view.message = interaction.message
         embed = games_case_admin_embed(new_view.selected_case_id, notice=notice)
-        await interaction.response.edit_message(embed=embed, view=new_view)
+        await interaction.edit_original_response(embed=embed, view=new_view)
 
     @discord.ui.button(label="Create Case", style=discord.ButtonStyle.success, emoji="➕", row=1, custom_id="case_manager_create")
     async def create_case(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -6094,18 +6261,20 @@ class CaseAdminPanelView(discord.ui.View):
         case = self.selected_case()
         if not case:
             return await interaction.response.send_message("Select a case first.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
         try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE mcwv_cases SET enabled = NOT enabled WHERE id = %s RETURNING enabled", (case["id"],))
                 row = cur.fetchone()
             conn.commit()
             if not row:
-                return await interaction.response.send_message("❌ That case no longer exists.", ephemeral=True)
+                return await interaction.followup.send("❌ That case no longer exists.", ephemeral=True)
+            await games_refresh_interaction_caches()
             await self.refresh_message(
                 interaction, notice=f"{case['name']} is now {'enabled' if row[0] else 'disabled'}."
             )
         except Exception as exc:
-            await interaction.response.send_message(f"❌ Toggle failed: `{type(exc).__name__}`", ephemeral=True)
+            await interaction.followup.send(f"❌ Toggle failed: `{type(exc).__name__}`", ephemeral=True)
 
     @discord.ui.button(label="Delete Case", style=discord.ButtonStyle.danger, emoji="🗑️", row=2, custom_id="case_manager_delete")
     async def delete_case(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -6174,6 +6343,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
                     (case.strip(), int(price), use_emoji, interaction.user.id))
                 cid = cur.fetchone()[0]
             conn.commit()
+            await games_refresh_interaction_caches()
             return await interaction.followup.send(
                 f"✅ Case **{case}** created ({price:,} coins, id {cid}){emoji_note}. Add roles with `/caseadmin add`.",
                 ephemeral=True)
@@ -6219,6 +6389,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
                     ON CONFLICT (case_id, role_id) DO UPDATE SET chance = EXCLUDED.chance
                 """, (cid, role.id, chance))
             conn.commit()
+            await games_refresh_interaction_caches()
             return await interaction.followup.send(f"✅ {role.mention} added to **{case}** at **{chance:g}%** (total now {new_total:g}%).", ephemeral=True)
 
         if action == "remove":
@@ -6231,24 +6402,23 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
                     return await interaction.followup.send("❌ Case not found.", ephemeral=True)
                 cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s AND role_id = %s", (int(row[0]), role.id))
             conn.commit()
+            await games_refresh_interaction_caches()
             return await interaction.followup.send(f"✅ {role.mention} removed from **{case}**.", ephemeral=True)
 
         if action == "list":
-            with conn.cursor() as cur:
-                cur.execute("SELECT id, name, price, emoji, enabled FROM mcwv_cases ORDER BY name")
-                cases = cur.fetchall()
+            cases = games_case_catalog(enabled_only=False, limit=100)
             if not cases:
                 return await interaction.followup.send("No cases yet — `/caseadmin create` one.", ephemeral=True)
             lines = []
-            for cid, cname, cprice, cemoji, cenabled in cases:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT COALESCE(SUM(chance), 0) FROM mcwv_case_contents WHERE case_id = %s", (cid,))
-                    used = float(cur.fetchone()[0] or 0)
-                    cur.execute("SELECT role_id, chance FROM mcwv_case_contents WHERE case_id = %s ORDER BY chance DESC", (cid,))
-                    contents = cur.fetchall()
-                status = "🟢" if cenabled else "🔴"
-                roles_txt = ", ".join(f"<@&{rid}> {ch:g}%" for rid, ch in contents) or "no roles"
-                lines.append(f"{status} {cemoji} **{cname}** — {cprice:,} coins · roles used {used:g}%\n　{roles_txt}")
+            for item in cases:
+                contents = item.get("contents") or []
+                used = sum(float(chance) for _role_id, chance in contents)
+                status = "🟢" if item.get("enabled") else "🔴"
+                roles_txt = ", ".join(f"<@&{rid}> {chance:g}%" for rid, chance in contents) or "no roles"
+                lines.append(
+                    f"{status} {item['emoji']} **{item['name']}** — {item['price']:,} coins · "
+                    f"roles used {used:g}%\n　{roles_txt}"
+                )
             embed = discord.Embed(title="🎁 All Cases", description="\n".join(lines), color=discord.Color.from_rgb(168, 130, 255))
             embed.set_footer(text="/caseadmin add|remove|delete|toggle|stats")
             return await interaction.followup.send(embed=embed, ephemeral=True)
@@ -6264,6 +6434,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
                 cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s", (row[0],))
                 cur.execute("DELETE FROM mcwv_cases WHERE id = %s", (row[0],))
             conn.commit()
+            await games_refresh_interaction_caches()
             return await interaction.followup.send(f"✅ Case **{case}** deleted (roll history kept).", ephemeral=True)
 
         if action == "toggle":
@@ -6275,6 +6446,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
             conn.commit()
             if not row:
                 return await interaction.followup.send("❌ Case not found.", ephemeral=True)
+            await games_refresh_interaction_caches()
             return await interaction.followup.send(f"✅ **{case}** is now {'enabled 🟢' if row[0] else 'disabled 🔴'}.", ephemeral=True)
 
         if action == "stats":
@@ -6316,6 +6488,7 @@ class TriviaAnswerView(discord.ui.View):
     async def _answer(self, interaction: discord.Interaction, idx: int):
         if self.answered or interaction.user.id != self.session["user_id"]:
             return await interaction.response.send_message("This question is already answered / not yours.", ephemeral=True)
+        await interaction.response.defer()
         self.answered = True
         self.stop()  # prevents on_timeout from advancing the session a second time
         self.session["last_activity"] = time.time()
@@ -6326,7 +6499,7 @@ class TriviaAnswerView(discord.ui.View):
             elif i == idx:
                 child.style = discord.ButtonStyle.danger
         try:
-            await interaction.response.edit_message(view=self)
+            await interaction.edit_original_response(view=self)
         except Exception:
             pass
         correct = idx == self.correct
@@ -6436,9 +6609,9 @@ async def games_trivia_next(ctx, session):
 
 @bot.tree.command(name="trivia", description="PS99 trivia — 5 questions, 20 coins per correct", guild=guild_obj)
 async def games_trivia(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.user.id in ACTIVE_TRIVIA:
         return await interaction.followup.send("❌ You already have a trivia session running — finish it first!", ephemeral=True)
     allowed, retry_at = (True, None) if games_is_unlimited(interaction.user.id) else \
@@ -6715,9 +6888,12 @@ def games_random_word_pool():
 
 
 async def games_egg_autocomplete(interaction: discord.Interaction, current: str):
-    eggs = games_get_eggs()
+    with _games_interaction_cache_lock:
+        names = list(_games_egg_choices_cache)
+    if not names:
+        names = ["Clan Egg"]
     cur = (current or "").strip().lower()
-    matches = [e["name"] for e in eggs if not cur or cur in e["name"].lower()][:25]
+    matches = [name for name in names if not cur or cur in name.lower()][:25]
     return [app_commands.Choice(name=n, value=n) for n in matches]
 
 
@@ -6820,9 +6996,9 @@ def games_random_exist_pet():
 @app_commands.describe(egg="Egg name (default: featured egg)")
 @app_commands.autocomplete(egg=games_egg_autocomplete)
 async def games_hatch(interaction: discord.Interaction, egg: str = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer()
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     eggs = games_get_eggs()
     if not eggs:
         return await interaction.followup.send("❌ No eggs available right now.", ephemeral=True)
@@ -6954,9 +7130,9 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
 @app_commands.describe(egg="Egg name for contents + odds")
 @app_commands.autocomplete(egg=games_egg_autocomplete)
 async def games_eggs(interaction: discord.Interaction, egg: str = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     eggs = games_get_eggs()
     if not eggs:
         return await interaction.followup.send("No eggs synced yet — try `/gamesadmin sync` (owner).", ephemeral=True)
@@ -7133,9 +7309,9 @@ async def games_grant_role(guild, user_id, kind):
     app_commands.Choice(name="Tower", value="tower"),
 ])
 async def games_top(interaction: discord.Interaction, games: str = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     try:
         embed = await games_top_embed(interaction.user.id, games)
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -7854,9 +8030,9 @@ class GamesHubView(discord.ui.View):
 
 @bot.tree.command(name="games", description="The MCWV games hub — how everything works", guild=guild_obj)
 async def games_hub(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     embed = await games_hub_embed(interaction.user)
     view = GamesHubView(interaction.user.id)
     games_footer(embed, "Quick-play buttons below · full rules in /gamesguide")
@@ -7909,12 +8085,13 @@ class GameStaffRoleSelect(discord.ui.RoleSelect):
             return await interaction.response.send_message(
                 f"❌ `@everyone` and managed/integration roles cannot be game staff: {names}", ephemeral=True
             )
+        await interaction.response.defer(ephemeral=True)
         ok, result = games_set_staff_role_ids(role.id for role in roles)
         if not ok:
-            return await interaction.response.send_message(f"❌ Could not save roles: `{result}`", ephemeral=True)
+            return await interaction.followup.send(f"❌ Could not save roles: `{result}`", ephemeral=True)
         new_view = GameStaffRoleView(view.owner_id)
         new_view.message = interaction.message
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=games_staff_embed(interaction.guild, f"Saved {len(result)} game-staff role(s)."),
             view=new_view,
         )
@@ -7944,12 +8121,13 @@ class GameStaffRoleView(discord.ui.View):
 
     @discord.ui.button(label="Clear Roles (Owner Only)", style=discord.ButtonStyle.danger, emoji="🧹", row=1)
     async def clear_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         ok, result = games_set_staff_role_ids([])
         if not ok:
-            return await interaction.response.send_message(f"❌ Could not clear roles: `{result}`", ephemeral=True)
+            return await interaction.followup.send(f"❌ Could not clear roles: `{result}`", ephemeral=True)
         new_view = GameStaffRoleView(self.owner_id)
         new_view.message = interaction.message
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=games_staff_embed(interaction.guild, "Game staff cleared; only owners now have access."),
             view=new_view,
         )
@@ -7977,9 +8155,9 @@ class GameStaffRoleView(discord.ui.View):
     app_commands.Choice(name="stats", value="stats"),
 ])
 async def games_admin(interaction: discord.Interaction, action: str, value: str = None):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if not games_owner_check(interaction.user):
         return await interaction.followup.send("❌ Owner only.", ephemeral=True)
 
@@ -8079,6 +8257,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             with conn.cursor() as cur:
                 cur.execute("INSERT INTO mcwv_game_testers (discord_id, added_by) VALUES (%s,%s) ON CONFLICT (discord_id) DO NOTHING", (uid, interaction.user.id))
             conn.commit()
+            _games_tester_cache[uid] = (time.monotonic() + _GAMES_TESTER_CACHE_TTL, True)
             await interaction.followup.send(f"✅ <@{uid}> added as a game tester.", ephemeral=True)
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed: `{type(exc).__name__}`", ephemeral=True)
@@ -8092,6 +8271,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM mcwv_game_testers WHERE discord_id = %s", (uid,))
             conn.commit()
+            _games_tester_cache[uid] = (time.monotonic() + _GAMES_TESTER_CACHE_TTL, False)
             await interaction.followup.send(f"✅ <@{uid}> removed from testers.", ephemeral=True)
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed: `{type(exc).__name__}`", ephemeral=True)
@@ -8250,9 +8430,9 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
     app_commands.Choice(name="draw now (owner)", value="draw"),
 ])
 async def games_lottery(interaction: discord.Interaction, action: str, amount: int = 1):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if action == "buy":
         n = max(1, int(amount))
         owned = games_lottery_owned(interaction.user.id)
@@ -8308,9 +8488,9 @@ async def games_lottery(interaction: discord.Interaction, action: str, amount: i
 # ---------- /tower (chat-based) ----------
 @bot.tree.command(name="tower", description="Tower of Pets — endless mixed floors, 3 hearts (chat game)", guild=guild_obj)
 async def games_tower(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     session = ACTIVE_TOWER.get(interaction.user.id)
     if session and session.get("active"):
         return await interaction.followup.send(
@@ -8346,9 +8526,9 @@ async def games_tower(interaction: discord.Interaction):
 @bot.tree.command(name="toweranswer", description="Answer a Tower trivia floor", guild=guild_obj)
 @app_commands.describe(answer="A/B/C/D or the answer text")
 async def games_tower_answer(interaction: discord.Interaction, answer: str):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     session = ACTIVE_TOWER.get(interaction.user.id)
     if not session or not session.get("active"):
         return await interaction.followup.send("No active tower run — start one with `/tower`.", ephemeral=True)
@@ -8452,9 +8632,9 @@ def games_history_trivia_questions(limit=8):
 
 @bot.tree.command(name="historytrivia", description="MCWV history trivia — questions from OUR war database", guild=guild_obj)
 async def games_history_trivia(interaction: discord.Interaction):
-    if not games_gate_allowed(interaction):
-        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.user.id in ACTIVE_TRIVIA:
         return await interaction.followup.send("❌ You already have a trivia session running — finish it first!", ephemeral=True)
     allowed, retry_at = (True, None) if games_is_unlimited(interaction.user.id) else games_cooldown_claim(
@@ -8463,7 +8643,7 @@ async def games_history_trivia(interaction: discord.Interaction):
     if not allowed:
         retry = discord.utils.format_dt(retry_at, "R") if retry_at else "soon"
         return await interaction.followup.send(f"⏳ Your next history run is available {retry}.", ephemeral=True)
-    qs = games_history_trivia_questions(5)
+    qs = await asyncio.to_thread(games_history_trivia_questions, 5)
     if not qs:
         return await interaction.followup.send("❌ Couldn't generate history questions right now.", ephemeral=True)
     session = {
@@ -8524,6 +8704,62 @@ GAMES_TRIVIA_SEED[:] = _trivia_clean
 
 
 
+_games_event_loop_lag = 0.0
+_games_watchdog_last = None
+
+
+@tasks.loop(seconds=2)
+async def games_event_loop_watchdog():
+    """Expose/log event-loop stalls that could threaten interaction deadlines."""
+    global _games_event_loop_lag, _games_watchdog_last
+    now = asyncio.get_running_loop().time()
+    if _games_watchdog_last is not None:
+        _games_event_loop_lag = max(0.0, now - _games_watchdog_last - 2.0)
+        if _games_event_loop_lag >= 1.0:
+            print(f"[timeout-watchdog] event loop lag {_games_event_loop_lag:.3f}s")
+    _games_watchdog_last = now
+
+
+@bot.tree.error
+async def games_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"[interaction-error] command={getattr(interaction.command, 'name', 'unknown')} type={type(error).__name__}")
+    message = "⚠️ That action could not be completed. Please try again."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as response_exc:
+        print(f"[interaction-error] response failed: {type(response_exc).__name__}")
+
+
+async def _games_view_on_error(self, interaction: discord.Interaction, error: Exception, item):
+    print(f"[component-error] item={type(item).__name__} type={type(error).__name__}")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("⚠️ That control failed safely. Please try again.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ That control failed safely. Please try again.", ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _games_modal_on_error(self, interaction: discord.Interaction, error: Exception):
+    print(f"[modal-error] modal={type(self).__name__} type={type(error).__name__}")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("⚠️ That form failed safely. Please try again.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ That form failed safely. Please try again.", ephemeral=True)
+    except Exception:
+        pass
+
+
+# Central safety net for every current and future View/Modal in this service.
+discord.ui.View.on_error = _games_view_on_error
+discord.ui.Modal.on_error = _games_modal_on_error
+
+
 @bot.event
 async def on_ready():
     global session
@@ -8535,6 +8771,8 @@ async def on_ready():
         print(f"[discord] synced {len(synced)} MCWV Games commands")
     if not games_housekeeping_loop.is_running():
         games_housekeeping_loop.start()
+    if not games_event_loop_watchdog.is_running():
+        games_event_loop_watchdog.start()
     await bot.change_presence(activity=discord.Game(name="MCWV Games · /games"))
     print(f"[discord] ready as {bot.user} ({bot.user.id})")
 
@@ -8545,12 +8783,28 @@ async def on_disconnect():
 
 
 def initialize_database():
+    global _database_initializing
     if not DATABASE_URL:
         raise RuntimeError("Missing required DATABASE_URL environment variable")
     if ensure_db_connection() is None:
         raise RuntimeError("Could not connect to the games database")
-    init_base_schema()
-    init_games_tables()
+    try:
+        init_base_schema()
+        init_games_tables()
+        # Prewarm settings used by component permission checks; modal-opening clicks
+        # must not perform database I/O before Discord is acknowledged.
+        db_get_setting(GAMES_SETTING_ENABLED, "0")
+        db_get_setting(GAMES_SETTING_STAFF_ROLES, None)
+        # This runs before Discord starts, so all autocomplete callbacks begin with
+        # a DB-free snapshot instead of querying on their first keystroke.
+        games_refresh_interaction_caches_sync()
+    finally:
+        _database_initializing = False
+        if conn is not None and conn.closed == 0:
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
+                cur.execute(f"SET lock_timeout = {DB_LOCK_TIMEOUT_MS}")
+                cur.execute("SET idle_in_transaction_session_timeout = 10000")
 
 
 def main():
