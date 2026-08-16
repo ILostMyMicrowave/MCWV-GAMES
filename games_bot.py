@@ -96,7 +96,9 @@ def ensure_db_connection():
     try:
         return _connect_database()
     except Exception as exc:
-        print(f"[database] connection failed: {type(exc).__name__}: {exc}")
+        # Connection/DSN parser errors can echo credentials. Log only the
+        # exception class so malformed secret values never reach host logs.
+        print(f"[database] connection failed: {type(exc).__name__}")
         return None
 
 
@@ -191,7 +193,8 @@ def _readonly_connection():
             connect_timeout=5,
         )
     except Exception as exc:
-        print(f"[mcwv-readonly] connection failed: {exc}")
+        # Never echo a connection exception: malformed DSNs can contain the password.
+        print(f"[mcwv-readonly] connection failed: {type(exc).__name__}")
         return None
 
 
