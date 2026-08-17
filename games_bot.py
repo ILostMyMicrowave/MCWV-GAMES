@@ -1,3 +1,4 @@
+
 """MCWV Games — standalone Discord games/economy bot.
 
 This service intentionally contains no clan, ticket, application, invite,
@@ -13,6 +14,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -102,6 +104,7 @@ _games_interaction_cache_lock = threading.RLock()
 _games_case_choices_cache = []
 _games_case_catalog_cache = []
 _games_pet_choices_cache = []
+_games_pet_asset_cache = {}  # normalized pet name -> current asset ID
 _games_egg_choices_cache = []
 _games_tester_cache = {}
 _GAMES_TESTER_CACHE_TTL = 30.0
@@ -501,68 +504,53 @@ GAMES_HATCH_TIERS = (
     ("common", None),  # remainder
 )
 
-# Real pet seed (name -> rbxassetid), harvested from public db.biggames.io pages.
-# The daily item sync can extend this later.
+# Emergency icon seed used before the first public-data sync. Every asset is the
+# pet's current thumbnail from the official BIG Games Pets collection; asset IDs
+# must stay one-to-one so one pet can never masquerade as another.
 GAMES_PET_SEED = {
     "Huge Basket Bunny": "75145545226238",
-    "Huge Blurred Axolotl": "89262001520583",
+    "Huge Blurred Axolotl": "89638501740571",
     "Huge Corrupt Butterfly": "18882974863",
     "Huge Leprechaun Kitsune": "100650487607408",
     "Huge Lucki Angelus": "139803624702732",
-    "Huge Mining Monkey": "104634632776696",
+    "Huge Mining Monkey": "103555083432476",
     "Huge Player Fox": "101605254258375",
     "Huge Rogue Squid": "82176106497018",
-    "Huge Shuriken Corgi": "18978050941",
+    "Huge Shuriken Corgi": "18978050838",
     "Huge Temporal Owl": "18882992626",
-    "Titanic Angry Yeti": "131125477985744",
-    "Titanic Arcane Halo Cat": "131125477985744",
-    "Titanic Arcane Void Cat": "131125477985744",
-    "Titanic Axolotl": "131125477985744",
-    "Titanic Bread Shiba": "131125477985744",
-    "Titanic Calico Cat": "131125477985744",
-    "Titanic Captain Octopus": "131125477985744",
-    "Titanic Cheerful Yeti": "131125477985744",
-    "Titanic Chest Mimic": "131125477985744",
+    "Titanic Angry Yeti": "118155614090525",
+    "Titanic Arcane Halo Cat": "94452581960646",
+    "Titanic Arcane Void Cat": "77026614501642",
+    "Titanic Axolotl": "14976585715",
+    "Titanic Bread Shiba": "16393819211",
+    "Titanic Calico Cat": "89706854037994",
+    "Titanic Captain Octopus": "108839170452682",
+    "Titanic Cheerful Yeti": "14976595593",
+    "Titanic Chest Mimic": "121868378193136",
     "Titanic Clover Butterfly": "131125477985744",
-    "Titanic Disco Ball Agony": "131125477985744",
-    "Titanic Dot Matrix Kitsune": "131125477985744",
-    "Titanic Helicopter Corgi": "131125477985744",
+    "Titanic Disco Ball Agony": "79337032741269",
+    "Titanic Dot Matrix Kitsune": "101711904618223",
+    "Titanic Helicopter Corgi": "139030108461655",
     "Titanic Irish Wolfhound": "125815340060379",
-    "Titanic Lucki Chest Mimic": "82078892883300",
-    "Titanic Mucki": "131125477985744",
-    "Titanic Nyan Cat": "131125477985744",
-    "Titanic Pink Lucky Block": "131125477985744",
-    "Titanic Prickly Panda": "131125477985744",
+    "Titanic Lucki Chest Mimic": "96487317914550",
+    "Titanic Mucki": "90224746206001",
+    "Titanic Nyan Cat": "102693200913432",
+    "Titanic Pink Lucky Block": "106313575575295",
+    "Titanic Prickly Panda": "110590155279741",
     "Titanic Sandcastle Kraken": "90627425215733",
-    "Titanic Smiley Penguin": "131125477985744",
-    "Titanic Super Coral Stingray": "131125477985744",
-    "Gargantuan Capybara": "131125477985744",
-    "Gargantuan Fluffy Cat": "131125477985744",
+    "Titanic Smiley Penguin": "112850579981229",
+    "Titanic Super Coral Stingray": "78134385272600",
+    "Gargantuan Capybara": "74737089424281",
+    "Gargantuan Fluffy Cat": "122984499289928",
 }
 
-GAMES_EGG_SEED = [
-    {
-        "name": "Clan Egg",
-        "emoji": "\U0001f95a",
-        "description": "The MCWV test egg — full rarity ladder.",
-        "tiers": [
-            ("titanic", 0.5, [n for n in GAMES_PET_SEED if n.startswith("Titanic")]),
-            ("huge", 2.0, [n for n in GAMES_PET_SEED if n.startswith("Huge") or n.startswith("Gargantuan")]),
-            ("exclusive", 6.0, ["Exclusive Dragon", "Exclusive Phoenix"]),
-            ("epic", 15.0, ["Epic Unicorn", "Epic Griffin"]),
-            ("rare", 25.0, ["Rare Fox", "Rare Panda"]),
-            ("common", None, ["Clan Kitten", "Clan Puppy", "Clan Bird"]),
-        ],
-    },
-]
-
 GAMES_TRIVIA_SEED = [
-    ("How many Huges can you hatch from the Clan Egg test pool?", ["5", "10", "11", "20"], 2),
+    ("Which command shows synced eggs and their odds?", ["/eggs", "/pets", "/top", "/daily"], 0),
     ("What is the strongest pet rarity in PS99?", ["Huge", "Exclusive", "Titanic", "Gargantuan"], 3),
     ("Which of these is a real PS99 Titanic?", ["Titanic Nyan Cat", "Titanic Mega Dog", "Titanic Ultra Cat", "Titanic Bob"], 0),
     ("What does RAP stand for?", ["Recent Average Price", "Rare Active Pets", "Random Auction Price", "Rapid Auction Points"], 0),
     ("Which battle did MCWV finish #24 in?", ["Ninja Battle 2026", "Gummy Battle 2026", "Lunar Battle 2026", "Soccer Battle 2026"], 0),
-    ("What's the fun hatch rate for a Titanic in the Clan Egg?", ["0.05%", "0.5%", "5%", "50%"], 1),
+    ("Where do MCWV Games egg contents and odds come from?", ["BIG Games public data", "Made-up names", "Discord roles", "Random chat"], 0),
     ("What currency do clan war games use?", ["Coins", "Gems", "Diamonds", "Stars"], 0),
     ("Which pet starts with 'Gargantuan'?", ["Capybara", "Cat", "Dog", "Dragon"], 0),
     ("How many free hatches do you get per day?", ["1", "2", "3", "5"], 2),
@@ -1245,7 +1233,7 @@ def games_new_db_connection():
 def games_refresh_interaction_caches_sync():
     """Refresh DB-backed UI/autocomplete snapshots on a worker connection."""
     global _games_case_choices_cache, _games_case_catalog_cache
-    global _games_pet_choices_cache, _games_egg_choices_cache
+    global _games_pet_choices_cache, _games_pet_asset_cache, _games_egg_choices_cache
     worker = None
     try:
         worker = games_new_db_connection()
@@ -1276,18 +1264,33 @@ def games_refresh_interaction_caches_sync():
                 {"name": case["name"], "price": case["price"], "emoji": case["emoji"]}
                 for case in catalog if case["enabled"]
             ]
-            cur.execute(
-                "SELECT name FROM mcwv_game_pets "
-                "WHERE category ILIKE 'Huge%' OR category ILIKE 'Titanic%' OR category ILIKE 'Gargantuan%' "
-                "ORDER BY LOWER(name) LIMIT 1000"
-            )
-            pets = [str(row[0]) for row in cur.fetchall()]
-            cur.execute("SELECT name FROM mcwv_game_eggs ORDER BY LOWER(name) LIMIT 500")
-            eggs = [str(row[0]) for row in cur.fetchall()]
+            cur.execute("SELECT name, category, asset FROM mcwv_game_pets")
+            pet_rows = cur.fetchall()
+            pet_assets = {
+                games_pet_lookup_key(name): str(asset)
+                for name, _category, asset in pet_rows
+                if asset and re.fullmatch(r"\d{5,20}", str(asset))
+            }
+            for seed_name, seed_asset in GAMES_PET_SEED.items():
+                pet_assets.setdefault(games_pet_lookup_key(seed_name), str(seed_asset))
+            pets = sorted(
+                str(name) for name, category, asset in pet_rows
+                if asset and str(category or "").lower().startswith(("huge", "titanic", "gargantuan"))
+            )[:1000]
+            cur.execute("SELECT name, contents FROM mcwv_game_eggs ORDER BY LOWER(name) LIMIT 500")
+            eggs = []
+            for egg_name, raw_contents in cur.fetchall():
+                try:
+                    contents = raw_contents if isinstance(raw_contents, list) else json.loads(raw_contents or "[]")
+                except Exception:
+                    contents = []
+                if contents and all(games_pet_lookup_key(item[0]) in pet_assets for item in contents if item):
+                    eggs.append(str(egg_name))
         with _games_interaction_cache_lock:
             _games_case_choices_cache = cases
             _games_case_catalog_cache = catalog
             _games_pet_choices_cache = pets
+            _games_pet_asset_cache = pet_assets
             _games_egg_choices_cache = eggs
         return True
     except Exception as exc:
@@ -1724,6 +1727,12 @@ def games_weighted_choice(items, weights):
 
 def normalize_answer(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def games_pet_lookup_key(value):
+    """Punctuation/accent-insensitive key shared by egg and pet catalogues."""
+    ascii_value = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]", "", ascii_value.lower())
 
 
 def games_answers_match(raw_answer, pet_name):
@@ -2799,13 +2808,21 @@ async def coins_admin(interaction: discord.Interaction, action: str, user: disco
 # ---------------- GUESS THE PET ENGINE ----------------
 
 async def games_fetch_pet_icon(asset_id):
-    """Download a pet/egg icon — cached, with dual-host fallback. Returns bytes or None."""
-    if not asset_id:
+    """Fetch and validate a real pet/egg icon from the official image mirrors.
+
+    Invalid IDs, HTML/error bodies and corrupt images are never cached or shown.
+    A short failure cache prevents a broken asset from delaying every command.
+    """
+    asset_id = str(asset_id or "").strip()
+    if not re.fullmatch(r"\d{5,20}", asset_id):
         return None
-    asset_id = str(asset_id)
     cached = games_icon_from_cache(asset_id)
     if cached is not None:
         return cached
+    failed_at = _ICON_FAILURE_CACHE.get(asset_id)
+    if failed_at and time.time() - failed_at < _ICON_FAILURE_CACHE_TTL:
+        return None
+
     global session
     try:
         cur_loop = asyncio.get_running_loop()
@@ -2813,34 +2830,57 @@ async def games_fetch_pet_icon(asset_id):
         cur_loop = None
     if session is None or session.closed or (
             cur_loop is not None and getattr(session, "_loop", None) is not cur_loop):
-        # recreate when bound to a dead/other loop (e.g. after a reconnect)
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        # Recreate when bound to a dead/other loop (for example after reconnect).
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+
     for host in (PS99_API, GAMES_PUBLIC_API):
         try:
             async with session.get(
                 f"{host}/image/{asset_id}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=12),
+                headers={"User-Agent": "MCWV-Games/1.0 (pet icon delivery)"},
+                timeout=aiohttp.ClientTimeout(total=8),
             ) as res:
                 if res.status != 200:
                     continue
+                content_type = str(res.headers.get("Content-Type") or "").lower()
+                if not content_type.startswith("image/"):
+                    continue
                 data = await res.read()
-                if len(data) > 64:
+                if games_valid_icon_bytes(data):
                     games_icon_cache_put(asset_id, data)
+                    _ICON_FAILURE_CACHE.pop(asset_id, None)
                     return data
-        except Exception as exc:
-            print(f"[games] pet icon fetch failed {asset_id} @ {host}: {exc}")
+        except Exception:
             continue
+    _ICON_FAILURE_CACHE[asset_id] = time.time()
+    print(f"[games] no valid icon returned for asset {asset_id}")
     return None
 
 
-# ---------------- ICON LAYER: cache + drawn placeholders ----------------
-# Every visual falls back to a locally rendered placeholder, so nothing
-# ever shows as a broken/blank image when an asset is missing.
+# ---------------- ICON LAYER: validated real-image cache ----------------
 
-_ICON_CACHE = {}      # asset_id -> (fetched_ts, bytes)
+_ICON_CACHE = {}      # asset_id -> (fetched_ts, validated image bytes)
 _ICON_CACHE_MAX = 400
 _ICON_CACHE_TTL = 6 * 3600
+_ICON_FAILURE_CACHE = {}  # asset_id -> failed_ts
+_ICON_FAILURE_CACHE_TTL = 5 * 60
+
+
+def games_valid_icon_bytes(data):
+    """Return True only for a decodable, useful-size raster image."""
+    if not isinstance(data, (bytes, bytearray)) or not (256 <= len(data) <= 4 * 1024 * 1024):
+        return False
+    try:
+        with Image.open(BytesIO(data)) as probe:
+            if probe.format not in {"PNG", "JPEG", "WEBP"}:
+                return False
+            width, height = probe.size
+            if width < 64 or height < 64 or width > 4096 or height > 4096:
+                return False
+            probe.verify()
+        return True
+    except Exception:
+        return False
 
 
 def games_icon_from_cache(asset_id):
@@ -2851,11 +2891,14 @@ def games_icon_from_cache(asset_id):
 
 
 def games_icon_cache_put(asset_id, data):
-    _ICON_CACHE[str(asset_id)] = (time.time(), data)
+    if not games_valid_icon_bytes(data):
+        return False
+    _ICON_CACHE[str(asset_id)] = (time.time(), bytes(data))
     if len(_ICON_CACHE) > _ICON_CACHE_MAX:
         oldest = sorted(_ICON_CACHE.items(), key=lambda kv: kv[1][0])[:len(_ICON_CACHE) - _ICON_CACHE_MAX]
         for k, _v in oldest:
             _ICON_CACHE.pop(k, None)
+    return True
 
 
 def _games_font(size, bold=True):
@@ -2865,46 +2908,6 @@ def _games_font(size, bold=True):
         return ImageFont.truetype(path, size)
     except Exception:
         return ImageFont.load_default()
-
-
-def games_build_pet_placeholder(pet_name, tier="common", size=128):
-    """Rendered rarity card used when a pet has no icon (never a broken image)."""
-    try:
-        _emoji, label, rgb = games_tier_style(tier)
-        W = H = size
-        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.rounded_rectangle((6, 6, W - 6, H - 6), radius=18, fill=rgb + (255,))
-        d.rounded_rectangle((6, 6, W - 6, H - 6), radius=18, outline=(255, 255, 255, 210), width=3)
-        big = _games_font(44, True)
-        small = _games_font(13, True)
-        lbl = str(label).upper()
-        bb = d.textbbox((0, 0), lbl, font=big)
-        d.text(((W - (bb[2] - bb[0])) // 2, (H - (bb[3] - bb[1])) // 2 - 34), lbl, font=big, fill=(255, 255, 255, 255))
-        words = str(pet_name).split(" ")
-        lines, cur = [], ""
-        for w in words:
-            t = (cur + " " + w).strip()
-            if d.textlength(t, font=small) <= W - 24:
-                cur = t
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = w
-        if cur:
-            lines.append(cur)
-        lines = lines[:3]
-        ty = H - 24 - 15 * len(lines)
-        for ln in lines:
-            d.text((W // 2 - d.textlength(ln, font=small) // 2, ty), ln, font=small, fill=(255, 255, 255, 255))
-            ty += 15
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        return buf
-    except Exception as exc:
-        print(f"[games] pet placeholder failed: {exc}")
-        return None
 
 
 def games_build_egg_placeholder(size=64):
@@ -3477,10 +3480,6 @@ async def games_handle_answer(message):
                 icon_bytes = await games_fetch_pet_icon(asset)
         if icon_bytes:
             pet_file = games_icon_file(icon_bytes, "win_pet.png", size=128)
-        if pet_file is None:
-            ph = games_build_pet_placeholder(round_info["pet_name"], "common", size=128)
-            if ph:
-                pet_file = discord.File(ph, filename="win_pet.png")
         if pet_file:
             win_embed.set_thumbnail(url="attachment://win_pet.png")
         await message.channel.send(embed=win_embed, file=pet_file)
@@ -3983,16 +3982,18 @@ async def start_duel_round(channel, duel):
                 buf = games_build_round_image(icon, "zoom")
                 if buf:
                     file = discord.File(buf, filename="duel.png")
-            embed = discord.Embed(
-                title="🔢 DUEL — Exist Count",
-                description=f"<@{a_id}> vs <@{b_id}> · closest guess to this pet's **real exist count** wins **{duel['wager'] * 2:,}** 🪙!",
-                color=games_color("blue"),
-            )
-            embed.add_field(name="Pot", value=f"`{duel['wager']}` + `{duel['wager']}`", inline=True)
-            embed.add_field(name="Time limit", value=f"{GAMES_DUEL_TIMEOUT}s", inline=True)
-            games_footer(embed, "Type your number guess — e.g. 42000")
-            await channel.send(embed=embed, file=file)
-            return
+            if file:
+                embed = discord.Embed(
+                    title="🔢 DUEL — Exist Count",
+                    description=f"<@{a_id}> vs <@{b_id}> · closest guess to this pet's **real exist count** wins **{duel['wager'] * 2:,}** 🪙!",
+                    color=games_color("blue"),
+                )
+                embed.add_field(name="Pot", value=f"`{duel['wager']}` + `{duel['wager']}`", inline=True)
+                embed.add_field(name="Time limit", value=f"{GAMES_DUEL_TIMEOUT}s", inline=True)
+                games_footer(embed, "Type your number guess — e.g. 42000")
+                await channel.send(embed=embed, file=file)
+                return
+            duel["game_type"] = "scramble"
     # fallback: scramble
     pool = games_random_word_pool()
     word = games_pick_random(pool, scope=f"duel_word:{duel.get('id')}", max_recent=3)
@@ -4418,7 +4419,7 @@ def games_petdle_target():
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = f"games_petdle_target_{day}"
     pool = sorted({
-        p["name"] for p in games_get_pets()
+        p["name"] for p in games_get_pets(require_asset=True)
         if 4 <= len(normalize_answer(p.get("name"))) <= 16
     } or {
         name for name in GAMES_PET_SEED
@@ -4598,10 +4599,6 @@ async def games_petdle(interaction: discord.Interaction, guess: str = None):
         asset = games_pet_asset(target)
         icon = await games_fetch_pet_icon(asset) if asset else None
         file = games_icon_file(icon, "petdle.png", size=128) if icon else None
-        if file is None:
-            ph = games_build_pet_placeholder(target, "common", size=128)
-            if ph:
-                file = discord.File(ph, filename="petdle.png")
         if file:
             embed.set_thumbnail(url="attachment://petdle.png")
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
@@ -5655,14 +5652,16 @@ async def games_housekeeping_loop():
         # 4. Real pet/egg sync (daily, threaded, batched — a few seconds)
         last_sync = int(db_get_setting("games_eggs_synced_at", "0") or 0)
         if time.time() - last_sync > 24 * 3600:
-            try:
-                await asyncio.to_thread(games_sync_eggs_v2)
-            except Exception as exc:
-                print(f"[games] egg sync failed: {exc}")
+            # Pets first so every game sees current name→asset mappings before
+            # newly synced egg contents can be hatched.
             try:
                 await asyncio.to_thread(games_sync_pets_from_web)
             except Exception as exc:
                 print(f"[games] pet sync failed: {exc}")
+            try:
+                await asyncio.to_thread(games_sync_eggs_v2)
+            except Exception as exc:
+                print(f"[games] egg sync failed: {exc}")
         # 5. Lottery auto-draw (Sunday 20:00 UTC window, threaded)
         now_dt = datetime.now(timezone.utc)
         if now_dt.weekday() == 6 and now_dt.hour >= 20:
@@ -5752,150 +5751,6 @@ def games_remember(scope, item, max_recent=None):
     cap = max_recent if max_recent is not None else _RECENT_MAX
     if len(recent) > cap:
         recent.pop(0)
-
-
-# ---------- REAL EGGS: sync from the Big Games database ----------
-def games_egg_fallback_pool():
-    return [
-        {
-            "slug": "clan-egg", "name": "Clan Egg", "icon_asset": None,
-            "rarity": "Legendary", "rap": 0,
-        },
-        {
-            "slug": "exclusive-cosmic-egg", "name": "Exclusive Cosmic Egg", "icon_asset": "14146204107",
-            "rarity": "Exclusive", "rap": 728_520_000,
-        },
-        {
-            "slug": "active-huge-egg", "name": "Active Huge Egg", "icon_asset": "16756521111",
-            "rarity": "Exclusive", "rap": 292_970_000,
-        },
-    ]
-
-
-def _games_parse_eggs_index():
-    """Fetch + parse the public eggs index. Returns list of dicts."""
-    import urllib.request as _ur
-    try:
-        req = _ur.Request(
-            "https://db.biggames.io/database/eggs",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        )
-        with _ur.urlopen(req, timeout=25) as r:
-            html = r.read().decode("utf-8", "replace")
-    except Exception as exc:
-        print(f"[games] egg index fetch failed: {exc}")
-        return []
-    eggs = []
-    # cards: <img src="/api/thumbnails/asset/{id}" alt="{Name}" ...> ... Rarity: {rarity} ... RAP {value}
-    for m in re.finditer(
-        r'<img src="/api/thumbnails/asset/(\d+)" alt="([^"]+)"[^>]*>.*?Rarity:\s*([^"<]+).*?aria-label="RAP">.*?</svg>\s*<span[^>]*>([\d.]+)([KMBT]?)</span>',
-        html, re.S,
-    ):
-        icon_asset, name, rarity, rap_val, rap_suffix = m.groups()
-        try:
-            rap = float(rap_val)
-            mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(rap_suffix.upper(), 1)
-            rap = int(rap * mult)
-        except Exception:
-            rap = 0
-        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        eggs.append({
-            "slug": slug, "name": name, "icon_asset": icon_asset,
-            "rarity": rarity.strip(), "rap": rap,
-        })
-    # dedupe by name, keep first
-    seen = set()
-    unique = []
-    for e in eggs:
-        if e["slug"] in seen:
-            continue
-        seen.add(e["slug"])
-        unique.append(e)
-    print(f"[games] parsed {len(unique)} eggs from the Big Games database")
-    return unique
-
-
-def games_sync_eggs_from_web():
-    """Sync the real egg list into mcwv_game_eggs (threaded callers only)."""
-    try:
-        if not db_enabled():
-            return False
-        eggs = _games_parse_eggs_index()
-        if len(eggs) < 3:
-            print("[games] egg sync got too few results — using fallback pool")
-            eggs = games_egg_fallback_pool()
-        with conn.cursor() as cur:
-            for e in eggs:
-                cur.execute("""
-                    INSERT INTO mcwv_game_eggs (slug, name, icon_asset, rarity, rap, synced_at)
-                    VALUES (%s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (slug) DO UPDATE SET
-                        name = EXCLUDED.name,
-                        icon_asset = EXCLUDED.icon_asset,
-                        rarity = EXCLUDED.rarity,
-                        rap = EXCLUDED.rap,
-                        synced_at = NOW()
-                """, (e["slug"][:80], e["name"][:80], e["icon_asset"], e["rarity"][:40], int(e["rap"])))
-        conn.commit()
-        db_set_setting("games_eggs_synced_at", str(int(time.time())))
-        return True
-    except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        print(f"[games] egg sync failed: {exc}")
-        return False
-
-
-# Theme mapping for fallback egg contents.
-_GAMES_THEME_KEYWORDS = {
-    "capybara": ["Capybara"], "cat": ["Cat", "Calico", "Nyan"],
-    "dog": ["Dog", "Shiba", "Corgi", "Wolfhound", "Puppy"],
-    "dragon": ["Dragon", "Kraken", "Wyvern"], "kitsune": ["Kitsune", "Fox"],
-    "bunny": ["Bunny", "Rabbit"], "axolotl": ["Axolotl"],
-    "penguin": ["Penguin"], "unicorn": ["Unicorn"], "phoenix": ["Phoenix"],
-    "griffin": ["Griffin"], "cosmic": ["Cosmic", "Astral", "Nebula"],
-    "anime": ["Anime", "Otaku"], "cyber": ["Cyber", "Neon"],
-    "halloween": ["Pumpkin", "Ghost", "Bat"],
-    "christmas": ["Snow", "Elf", "Reindeer"],
-    "space": ["Space", "Astro", "Rocket"],
-}
-
-
-def games_theme_pool(egg_name, prefix):
-    """Pets starting with prefix whose name matches the egg's theme."""
-    pool = [p for p in GAMES_PET_SEED if p.startswith(prefix)]
-    if not pool:
-        return []
-    key = normalize_answer(egg_name)
-    themed = [p for p in pool if any(kw.lower() in key for kw in _GAMES_THEME_KEYWORDS.keys())
-              and any(p.lower().startswith(t.lower()) for t in _GAMES_THEME_KEYWORDS.get(next(kw for kw in _GAMES_THEME_KEYWORDS if kw.lower() in key), []))]
-    return themed or pool
-
-
-def games_egg_tiers(egg):
-    """Build the contents tier list for a real egg (theme-matched where possible)."""
-    name = egg.get("name") or "Clan Egg"
-    titanics = games_theme_pool(name, "Titanic") or [p for p in GAMES_PET_SEED if p.startswith("Titanic")]
-    huges = games_theme_pool(name, "Huge") or games_theme_pool(name, "Gargantuan") or [p for p in GAMES_PET_SEED if p.startswith(("Huge", "Gargantuan"))]
-    if not titanics:
-        titanics = [p for p in GAMES_PET_SEED if p.startswith("Titanic")]
-    if not huges:
-        huges = [p for p in GAMES_PET_SEED if p.startswith(("Huge", "Gargantuan"))]
-    theme_word = next((w.title() for w in _GAMES_THEME_KEYWORDS if w in normalize_answer(name)), "")
-    exclusive = [f"{theme_word} Exclusive Pet"] if theme_word else ["Exclusive Mystery Pet"]
-    epic = [f"{theme_word} Epic Pet"] if theme_word else ["Epic Mystery Pet"]
-    rare = [f"{theme_word} Rare Pet"] if theme_word else ["Rare Mystery Pet"]
-    common = [f"{theme_word} Pet"] if theme_word else ["Mystery Pet"]
-    return [
-        ("titanic", 0.5, titanics),
-        ("huge", 2.0, huges),
-        ("exclusive", 6.0, exclusive),
-        ("epic", 15.0, epic),
-        ("rare", 25.0, rare),
-        ("common", None, common),
-    ]
 
 
 def games_case_reward_role_error(guild, role):
@@ -6798,8 +6653,17 @@ def games_sync_pets_from_web():
                         exist_map[str(name)] = int(it.get("value") or 0)
         if not pets_data:
             return False
+        # A rare upstream duplicate can share a display name. Prefer the record
+        # whose configName exactly matches that display name rather than an old
+        # renamed alias, making the selected artwork deterministic.
+        pets_data = sorted(
+            pets_data,
+            key=lambda pet: str(pet.get("configName") or "")
+            != str((pet.get("configData") or {}).get("name") or ""),
+        )
         rows = []
         seen = set()
+        seen_assets = {}
         for p in pets_data:
             cfg = p.get("configData") or {}
             name = str(cfg.get("name") or p.get("configName") or "").strip()
@@ -6809,6 +6673,17 @@ def games_sync_pets_from_web():
             thumb = str(cfg.get("thumbnail") or cfg.get("icon") or "")
             m = re.search(r"(\d+)", thumb)
             asset = m.group(1) if m else None
+            # Pet thumbnails are one-to-one in the official collection. If an
+            # upstream regression reuses one asset for different names, never
+            # display that potentially wrong pet image for the later record.
+            if asset and asset in seen_assets and seen_assets[asset] != name:
+                print(
+                    f"[games] rejected duplicate pet icon asset {asset}: "
+                    f"{seen_assets[asset]!r} / {name!r}"
+                )
+                asset = None
+            elif asset:
+                seen_assets[asset] = name
             exist_count = exist_map.get(name, 0)
             slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:80]
             if not slug or slug in seen:
@@ -6834,9 +6709,15 @@ def games_sync_pets_from_web():
                            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
                         (str(int(time.time())),),
                     )
+                    icon_count = sum(1 for row in rows if row[3])
+                    cur.execute(
+                        """INSERT INTO settings (key, value) VALUES ('games_pet_icon_audit', %s)
+                           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
+                        (json.dumps({"pets": len(rows), "icons": icon_count}),),
+                    )
         finally:
             worker.close()
-        print(f"[games] synced {len(rows)} real pets")
+        print(f"[games] synced {len(rows)} real pets · {icon_count} unique icon assets")
         return True
     except Exception as exc:
         print(f"[games] pet sync failed: {exc}")
@@ -6915,41 +6796,57 @@ def games_get_eggs():
                 rows = cur.fetchall()
             if rows:
                 out = []
+                with _games_interaction_cache_lock:
+                    known_pet_assets = set(_games_pet_asset_cache)
                 for r in rows:
                     try:
                         contents = r[5] if isinstance(r[5], list) else json.loads(r[5] or "[]")
                     except Exception:
                         contents = []
+                    # Only expose hatchable eggs whose complete content list has
+                    # a real pet mapping. This preserves the published odds and
+                    # prevents any roll from resolving to placeholder artwork.
+                    if not contents or not all(
+                        item and games_pet_lookup_key(item[0]) in known_pet_assets
+                        for item in contents
+                    ):
+                        continue
                     out.append({
                         "slug": r[0], "name": r[1], "icon_asset": r[2], "rarity": r[3],
                         "rap": int(r[4] or 0), "contents": contents,
                     })
-                return out
+                if out:
+                    return out
     except Exception as exc:
         print(f"[games] egg list read failed: {exc}")
-    return [
-        {"slug": "clan-egg", "name": "Clan Egg", "icon_asset": None, "rarity": "Legendary", "rap": 0, "contents": []},
-    ]
+    return []
 
 
-def games_get_pets(categories=None):
-    """Real pets from the DB; filter by category prefixes (e.g. ('Huge','Titanic'))."""
+def games_get_pets(categories=None, require_asset=False):
+    """Real pets, optionally limited to rows with a usable icon asset ID."""
     try:
         if db_enabled():
+            clauses = []
+            params = []
+            if categories:
+                clauses.append("(" + " OR ".join(["category ILIKE %s" for _ in categories]) + ")")
+                params.extend(f"{category}%" for category in categories)
+            if require_asset:
+                clauses.append("asset IS NOT NULL AND asset ~ '^[0-9]{5,20}$'")
+            query = "SELECT name, category, asset, exist_count FROM mcwv_game_pets"
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
             with conn.cursor() as cur:
-                if categories:
-                    like = " OR ".join(["category ILIKE %s" for _ in categories])
-                    params = tuple(f"{c}%" for c in categories)
-                    cur.execute(f"SELECT name, category, asset, exist_count FROM mcwv_game_pets WHERE {like}", params)
-                else:
-                    cur.execute("SELECT name, category, asset, exist_count FROM mcwv_game_pets")
+                cur.execute(query, tuple(params))
+                rows = cur.fetchall()
+            if rows:
                 return [
                     {"name": r[0], "category": r[1], "asset": r[2], "exist_count": int(r[3] or 0)}
-                    for r in cur.fetchall()
+                    for r in rows
                 ]
     except Exception as exc:
         print(f"[games] pets read failed: {exc}")
-    # fallback to seed
+    # Every emergency-seed row has a checked, one-to-one asset.
     return [
         {"name": n, "category": ("Huge" if n.startswith("Huge") else "Titanic" if n.startswith("Titanic") else "Gargantuan"), "asset": a, "exist_count": 0}
         for n, a in GAMES_PET_SEED.items()
@@ -6957,24 +6854,32 @@ def games_get_pets(categories=None):
 
 
 def games_pet_asset(name):
-    """Asset id for a pet name (from the pets table or the seed)."""
-    if name in GAMES_PET_SEED:
-        return GAMES_PET_SEED[name]
+    """Current asset ID for a pet, with the static seed only as fallback.
+
+    Database data must win: the public Pets collection changes over time, while
+    the seed exists solely to make a brand-new installation usable pre-sync.
+    """
+    lookup_key = games_pet_lookup_key(name)
+    with _games_interaction_cache_lock:
+        cached_asset = _games_pet_asset_cache.get(lookup_key)
+    if cached_asset and re.fullmatch(r"\d{5,20}", str(cached_asset)):
+        return str(cached_asset)
     try:
         if db_enabled():
             with conn.cursor() as cur:
                 cur.execute("SELECT asset FROM mcwv_game_pets WHERE LOWER(name) = LOWER(%s) LIMIT 1", (name,))
                 row = cur.fetchone()
-                if row and row[0]:
+                if row and row[0] and re.fullmatch(r"\d{5,20}", str(row[0])):
                     return str(row[0])
     except Exception:
         pass
-    return None
+    seed_asset = GAMES_PET_SEED.get(str(name))
+    return str(seed_asset) if seed_asset and re.fullmatch(r"\d{5,20}", str(seed_asset)) else None
 
 
 def games_guess_pet_pool():
     """Huges + Titanics + Gargantuans (recognizable)."""
-    pool = [p["name"] for p in games_get_pets(("Huge", "Titanic", "Gargantuan"))]
+    pool = [p["name"] for p in games_get_pets(("Huge", "Titanic", "Gargantuan"), require_asset=True)]
     if not pool:
         pool = [p for p in GAMES_PET_SEED]
     return pool
@@ -6991,52 +6896,23 @@ def games_random_word_pool():
 async def games_egg_autocomplete(interaction: discord.Interaction, current: str):
     with _games_interaction_cache_lock:
         names = list(_games_egg_choices_cache)
-    if not names:
-        names = ["Clan Egg"]
     cur = (current or "").strip().lower()
     matches = [name for name in names if not cur or cur in name.lower()][:25]
     return [app_commands.Choice(name=n, value=n) for n in matches]
 
 
 def games_hatch_roll(egg):
-    """Roll from an egg dict with real `contents` ([[name, chance%], ...]).
-    Falls back to the theme ladder for eggs without contents."""
+    """Roll only from verified real contents ([[name, chance], ...])."""
     contents = egg.get("contents") or []
-    if contents:
-        total = sum(w for _, w in contents)
-        if total > 0:
-            names = [c[0] for c in contents]
-            weights = [c[1] for c in contents]
-            pick = games_weighted_choice(names, weights)
-            w = float(dict(contents).get(pick, 0))
-            tier = games_pet_roll_tier(pick, w, egg)
-            effective_chance = (w / total * 100.0) if total > 0 else 0.0
-            return pick, tier, effective_chance
-    # fallback ladder
-    tiers = games_egg_tiers(egg)
-    pet, tier = games_hatch_roll_tiers(tiers)
-    return pet, tier, None
-
-
-def games_hatch_roll_tiers(tiers):
-    """Roll from a tiers list: (tier, chance, pets)."""
-    tier_names, tier_weights = [], []
-    for tier, chance, pets in tiers:
-        if not pets:
-            continue
-        if chance is None:
-            continue
-        tier_names.append(tier)
-        tier_weights.append(float(chance))
-    common_weight = max(0.0, 100.0 - sum(tier_weights))
-    tier_names.append("common")
-    tier_weights.append(common_weight)
-    tier = games_weighted_choice(tier_names, tier_weights)
-    pool = next((pets for t, c, pets in tiers if t == tier), [])
-    if not pool:
-        pool = [t for t, c, pets in tiers for pets_ in [pets] for t in pets_] or ["Mystery Pet"]
-    pet = games_pick_random(pool, scope=f"hatch:{tier}")
-    return pet, tier
+    total = sum(float(weight) for _name, weight in contents)
+    if not contents or total <= 0:
+        return None, None, None
+    names = [entry[0] for entry in contents]
+    weights = [float(entry[1]) for entry in contents]
+    pick = games_weighted_choice(names, weights)
+    weight = float(dict(contents).get(pick, 0))
+    tier = games_pet_roll_tier(pick, weight, egg)
+    return pick, tier, weight / total * 100.0
 
 
 # ---------- FEATURED EGG (daily, double odds on the top tiers) ----------
@@ -7082,7 +6958,7 @@ def games_hatch_roll_featured(egg):
 # ---------- EXIST COUNT DUEL DATA ----------
 def games_random_exist_pet():
     """A random real pet with a known exist count (>0), for duels/trivia."""
-    pets = [p for p in games_get_pets() if p.get("exist_count", 0) > 1000]
+    pets = [p for p in games_get_pets(require_asset=True) if p.get("exist_count", 0) > 1000]
     if not pets:
         return None
     return secrets.choice(pets)
@@ -7114,6 +6990,11 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
         egg_def = next((e for e in eggs if e["slug"] == featured_slug), None) or eggs[0]
     egg_name = egg_def["name"]
     is_featured = egg_def["slug"] == featured_slug
+    if not egg_def.get("contents"):
+        return await interaction.followup.send(
+            "❌ That egg has no fully verified pet/icon data, so it cannot be hatched.",
+            ephemeral=True,
+        )
 
     free, used = games_free_use(interaction.user.id, "hatch")
     if not free:
@@ -7167,8 +7048,8 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
     except Exception:
         pass
 
-    # egg icon (author avatar) + pet image (thumbnail) — ALWAYS attach something:
-    # real icon when available, drawn placeholder otherwise. No broken images.
+    # Egg artwork may use an egg-only fallback, but pet artwork is real or
+    # omitted. A generic/incorrect pet image must never be shown.
     files = []
     egg_icon = None
     if egg_def.get("icon_asset"):
@@ -7185,10 +7066,6 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
         pet_file = games_icon_file(icon, "pet.png", size=128)
         if pet_file:
             files.append(pet_file)
-    if not any(f.filename == "pet.png" for f in files):
-        ph = games_build_pet_placeholder(pet_name, tier, size=128)
-        if ph:
-            files.append(discord.File(ph, filename="pet.png"))
 
     embed = discord.Embed(
         title=f"{tier_emoji} {pet_name}",
@@ -7741,7 +7618,8 @@ def games_build_wheel_frame(win_idx, spin_degrees):
 
 # ---------- SCRATCH IMAGE STRIP ----------
 async def games_build_scratch_strip(pet_names, covered=False):
-    # icons aligned to pet_names; missing icons stay None → drawn placeholder cell
+    # Icons stay aligned with their names. If a mirror is temporarily down, the
+    # real pet name is rendered instead of a generic or incorrect pet picture.
     icons = []
     if not covered:
         any_icon = False
@@ -7767,8 +7645,10 @@ async def games_build_scratch_strip(pet_names, covered=False):
     d = ImageDraw.Draw(strip)
     try:
         qf = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 72)
+        name_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
     except Exception:
         qf = ImageFont.load_default()
+        name_font = ImageFont.load_default()
     for i in range(n):
         x0 = pad + i * (160 + pad)
         d.rounded_rectangle((x0, 20, x0 + 160, 180), radius=16, fill=(26, 29, 48, 255),
@@ -7792,10 +7672,24 @@ async def games_build_scratch_strip(pet_names, covered=False):
             ImageDraw.Draw(mask).rounded_rectangle((0, 0, 160, 160), radius=16, fill=255)
             strip.paste(icons[i], (x0, 20), mask)
         elif i < len(icons):
-            # missing icon → drawn placeholder cell (never a blank slot)
-            bb = d.textbbox((0, 0), "?", font=qf)
-            tw, th = bb[2] - bb[0], bb[3] - bb[1]
-            d.text((x0 + (160 - tw) // 2, 20 + (160 - th) // 2 - 8), "?", font=qf, fill=(128, 134, 168, 255))
+            words = str(pet_names[i]).split()
+            lines, current = [], ""
+            for word in words:
+                candidate = f"{current} {word}".strip()
+                if d.textlength(candidate, font=name_font) <= 136:
+                    current = candidate
+                else:
+                    if current:
+                        lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+            lines = lines[:4] or ["Icon unavailable"]
+            y = 100 - (len(lines) * 10)
+            for line in lines:
+                width = d.textlength(line, font=name_font)
+                d.text((x0 + (160 - width) / 2, y), line, font=name_font, fill=(235, 238, 255, 255))
+                y += 22
     buf = BytesIO()
     strip.convert("RGB").save(buf, format="PNG", optimize=True)
     buf.seek(0)
@@ -8448,10 +8342,13 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         try:
             ok_pets = await asyncio.to_thread(games_sync_pets_from_web)
             ok_eggs = await asyncio.to_thread(games_sync_eggs_v2)
+            await games_refresh_interaction_caches()
             pets = len(games_get_pets())
+            pets_with_icons = len(games_get_pets(require_asset=True))
             eggs = len(games_get_eggs())
             await interaction.followup.send(
-                f"✅ Sync done — **{pets}** pets, **{eggs}** eggs (pets {'ok' if ok_pets else 'FAILED'}, eggs {'ok' if ok_eggs else 'FAILED'}).",
+                f"✅ Sync done — **{pets}** pets, **{pets_with_icons}** with unique icon assets, "
+                f"**{eggs}** eggs (pets {'ok' if ok_pets else 'FAILED'}, eggs {'ok' if ok_eggs else 'FAILED'}).",
                 ephemeral=True)
         except Exception as exc:
             await interaction.followup.send(f"❌ Sync failed: `{type(exc).__name__}`", ephemeral=True)
@@ -8785,7 +8682,7 @@ GAMES_TRIVIA_SEED.extend([
     ("What does RAP stand for?", ["Recent Average Price", "Rare Active Pets", "Random Auction Price", "Rapid Auction Points"], 0),
     ("How many pets are in the PS99 database?", ["~15,000", "~1,500", "~150", "~150,000"], 0),
     ("Which of these is a real Titanic?", ["Titanic Nyan Cat", "Titanic Mega Dog", "Titanic Ultra Cat", "Titanic Bob"], 0),
-    ("What is the fun hatch rate for a Huge in the Clan Egg?", ["2%", "0.5%", "10%", "20%"], 0),
+    ("What happens if an egg's pet icons cannot be verified?", ["The egg is withheld", "A fake pet is shown", "Odds are guessed", "Coins are doubled"], 0),
     ("Which stat do /duel exist-count rounds compare?", ["A pet's exist count", "Points", "Diamonds", "Account age"], 0),
     ("What does the Featured Egg get daily?", ["Doubled top-tier odds", "Free hatches", "Half price", "Nothing"], 0),
     ("How many free hatches per day?", ["3", "1", "5", "10"], 0),
