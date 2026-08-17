@@ -94,6 +94,7 @@ _database_initializing = True
 _DB_SETTING_CACHE_TTL = max(5.0, float(os.environ.get("DB_SETTING_CACHE_TTL", "30")))
 _db_setting_cache = {}
 _db_setting_cache_lock = threading.RLock()
+_db_setting_refreshing = set()
 
 # Autocomplete callbacks cannot be deferred. They therefore read only these
 # preloaded snapshots and never query PostgreSQL on a keystroke.
@@ -179,16 +180,81 @@ def init_base_schema():
         """)
 
 
+def _db_refresh_setting_sync(cache_key, default):
+    """Refresh one setting on an isolated worker connection."""
+    worker = None
+    try:
+        worker = games_new_db_connection()
+        if worker is None:
+            return False
+        with worker.cursor() as cur:
+            cur.execute("SELECT value FROM settings WHERE key = %s", (cache_key,))
+            row = cur.fetchone()
+        value = row[0] if row else default
+        with _db_setting_cache_lock:
+            _db_setting_cache[cache_key] = (
+                time.monotonic() + _DB_SETTING_CACHE_TTL,
+                value,
+            )
+        return True
+    except Exception as exc:
+        print(f"[database] setting refresh failed: {type(exc).__name__}")
+        return False
+    finally:
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+
+
+async def _db_refresh_setting(cache_key, default):
+    refreshed = False
+    try:
+        refreshed = await asyncio.to_thread(_db_refresh_setting_sync, cache_key, default)
+    finally:
+        with _db_setting_cache_lock:
+            if not refreshed:
+                cached = _db_setting_cache.get(cache_key)
+                if cached:
+                    # Keep serving the last known value and retry soon, without
+                    # starting a new connection attempt on every interaction.
+                    _db_setting_cache[cache_key] = (
+                        time.monotonic() + min(5.0, _DB_SETTING_CACHE_TTL),
+                        cached[1],
+                    )
+            _db_setting_refreshing.discard(cache_key)
+
+
+def _schedule_db_setting_refresh(cache_key, default):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    with _db_setting_cache_lock:
+        if cache_key in _db_setting_refreshing:
+            return True
+        _db_setting_refreshing.add(cache_key)
+    loop.create_task(_db_refresh_setting(cache_key, default))
+    return True
+
+
 def db_get_setting(key, default=None):
     cache_key = str(key)
     now = time.monotonic()
+    stale_value = default
     with _db_setting_cache_lock:
         cached = _db_setting_cache.get(cache_key)
-        if cached:
-            # Stale-while-running is intentional: Discord callbacks must never
-            # hit PostgreSQL before acknowledging. Bot setting writes update
-            # this cache immediately.
+        if cached and cached[0] > now:
             return cached[1]
+        if cached:
+            stale_value = cached[1]
+
+    if cached and _schedule_db_setting_refresh(cache_key, default):
+        # Serve the previous value for this interaction, then refresh off the
+        # event loop. The next permission check observes external DB changes.
+        return stale_value
+
     if not db_enabled():
         with _db_setting_cache_lock:
             _db_setting_cache[cache_key] = (now + _DB_SETTING_CACHE_TTL, default)
@@ -203,7 +269,7 @@ def db_get_setting(key, default=None):
         return value
     except Exception as exc:
         print(f"[database] setting read failed: {type(exc).__name__}")
-        return default
+        return stale_value
 
 
 def db_set_setting(key, value):
@@ -380,6 +446,14 @@ GAMES_SETTING_LOTTERY_END = "games_lottery_end_ts"
 GAMES_SETTING_INTEREST_RATE = "games_interest_rate_pct"
 GAMES_SETTING_INTEREST_CAP = "games_interest_cap"
 GAMES_SETTING_STAFF_ROLES = "games_staff_role_ids"       # JSON list, owner-managed
+# Before the owner saves an explicit role list, recognise the normal Game Staff
+# role by exact normalized name. An explicit saved list (including []) always
+# wins, so the owner can still restrict or clear access deliberately.
+GAMES_DEFAULT_STAFF_ROLE_NAMES = {
+    re.sub(r"[^a-z0-9]+", "", name.lower())
+    for name in os.environ.get("GAMES_STAFF_ROLE_NAMES", "Game Staff").split(",")
+    if name.strip()
+}
 
 GAMES_DEFAULT_CHANCE_PCT = 1
 GAMES_SPAWN_CHANNEL_COOLDOWN = 300      # seconds between spawns in one channel
@@ -1009,18 +1083,27 @@ def games_owner_check(member):
     return db_is_owner_discord(member.id)
 
 
-def games_staff_role_ids():
-    """Configured game-staff roles; legacy staff roles are the first-run default."""
+def _games_parse_staff_role_ids(raw):
+    """Return (role_ids, explicitly_configured) for the game-staff setting."""
     fallback = {int(ALLOWED_ROLE_ID)} if ALLOWED_ROLE_ID else set()
     fallback.update(int(rid) for rid in (MCWV_TICKET_STAFF_ROLE_IDS or []) if rid)
-    raw = db_get_setting(GAMES_SETTING_STAFF_ROLES, None)
     if raw is None:
-        return fallback
+        return fallback, False
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
-        return {int(rid) for rid in (parsed or []) if int(rid) > 0}
+        return {int(rid) for rid in (parsed or []) if int(rid) > 0}, True
     except Exception:
-        return fallback
+        # A malformed external value must not silently widen access. Keep the
+        # narrow legacy fallback and treat the setting as not safely configured.
+        return fallback, False
+
+
+def games_staff_role_ids():
+    """Configured game-staff IDs, or legacy IDs until a list is first saved."""
+    role_ids, _explicit = _games_parse_staff_role_ids(
+        db_get_setting(GAMES_SETTING_STAFF_ROLES, None)
+    )
+    return role_ids
 
 
 def games_set_staff_role_ids(role_ids):
@@ -1047,13 +1130,31 @@ def games_set_staff_role_ids(role_ids):
 
 
 def games_staff_check(member):
-    """Game staff can manage cases and manually start/stop Guess the Pet."""
+    """Authorise owners or members of the owner-managed game-staff roles.
+
+    On a first run where no role list has ever been saved, the exact normalized
+    role name ``Game Staff`` is a safe bootstrap fallback. Once the owner saves
+    a list — even an empty list — only those role IDs are authoritative.
+    """
     if games_owner_check(member):
         return True
-    if member is None or not isinstance(member, discord.Member):
+    if member is None:
         return False
-    member_roles = {int(getattr(role, "id", 0)) for role in getattr(member, "roles", [])}
-    return bool(member_roles & games_staff_role_ids())
+
+    roles = list(getattr(member, "roles", []) or [])
+    member_role_ids = {int(getattr(role, "id", 0) or 0) for role in roles}
+    raw = db_get_setting(GAMES_SETTING_STAFF_ROLES, None)
+    configured_role_ids, explicitly_configured = _games_parse_staff_role_ids(raw)
+    if member_role_ids & configured_role_ids:
+        return True
+    if explicitly_configured:
+        return False
+
+    member_role_names = {
+        re.sub(r"[^a-z0-9]+", "", str(getattr(role, "name", "")).lower())
+        for role in roles
+    }
+    return bool(member_role_names & GAMES_DEFAULT_STAFF_ROLE_NAMES)
 
 
 def games_case_staff_check(member):
@@ -8040,7 +8141,9 @@ async def games_hub(interaction: discord.Interaction):
 
 
 def games_staff_embed(guild, notice=None):
-    role_ids = games_staff_role_ids()
+    role_ids, explicitly_configured = _games_parse_staff_role_ids(
+        db_get_setting(GAMES_SETTING_STAFF_ROLES, None)
+    )
     role_lines = []
     for role_id in sorted(role_ids):
         role = guild.get_role(role_id) if guild else None
@@ -8056,9 +8159,18 @@ def games_staff_embed(guild, notice=None):
         ),
         color=games_color("purple"),
     )
+    if role_lines:
+        current_roles = "\n".join(role_lines)
+    elif not explicitly_configured:
+        current_roles = (
+            "**First-run fallback:** the exact `Game Staff` role is allowed until "
+            "the owner saves a role selection."
+        )
+    else:
+        current_roles = "**Owner only** — no game-staff roles selected."
     embed.add_field(
         name=f"Current roles ({len(role_ids)})",
-        value="\n".join(role_lines) if role_lines else "**Owner only** — no game-staff roles selected.",
+        value=current_roles,
         inline=False,
     )
     games_footer(embed, "Owner-only configuration · saved in PostgreSQL")
