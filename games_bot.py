@@ -603,16 +603,55 @@ def games_money(n):
     return f"🪙 **{int(n):,}**"
 
 
+# ============================================================
+# CUSTOM EMOJIS — mcwv_* emojis uploaded to the MCWV Games app.
+# Each entry is (emoji_name, emoji_id). These are application-owned,
+# so `<:name:id>` renders in any server the bot is in. When a key has
+# no custom emoji (id empty), games_emoji() falls back to a unicode icon.
+# ============================================================
+GAMES_CUSTOM_EMOJI = {
+    # pet rarities (titanic / huge / exclusive were deleted — they now fall
+    # back to Unicode via their fallback in games_tier_style).
+    "epic": ("mcwv_epic", "1539432378257248297"),
+    "rare": ("mcwv_rare", "1539432956538658886"),
+    "common": ("mcwv_common", "1539432078490214550"),
+    # economy / commands
+    "win": ("mcwv_win", "1539433645851545640"),
+    "streak": ("mcwv_streak", "1539433382922952775"),
+    "spin": ("mcwv_spin", "1539433282276433961"),
+    "shop": ("mcwv_shop", "1539433202853355672"),
+    "scratch": ("mcwv_scratch", "1539433089435045908"),
+    "pets": ("mcwv_pets", "1539432832731058206"),
+    "pay": ("mcwv_pay", "1539432719346442280"),
+    "duel": ("mcwv_duel", "1539432271281528883"),
+    "daily": ("mcwv_daily", "1539432168378470450"),
+    "bank": ("mcwv_bank", "1539431954863231026"),
+    "jackpot": ("mcwv_jackpot", "1539431780569055352"),
+    "hatch": ("mcwv_hatch", "1539431659420782622"),
+    "case_open": ("mcwv_case_open", "1539431535109873826"),
+    "credits": ("mcwv_credits", "1539431300828626995"),
+}
+
+
+def games_emoji(key, fallback=""):
+    """Resolve a semantic emoji key to a Discord custom emoji when available,
+    otherwise to the unicode `fallback`. Never raises."""
+    name, eid = GAMES_CUSTOM_EMOJI.get(key, ("", ""))
+    if name and eid and eid.isdigit():
+        return f"<:{name}:{eid}>"
+    return fallback
+
+
 def games_tier_style(tier):
     """(emoji, label, rgb tuple) per pet tier."""
     return {
-        "titanic": ("🌌", "TITANIC", (245, 158, 11)),
-        "huge": ("💥", "HUGE", (168, 85, 247)),
-        "gargantuan": ("🌠", "GARGANTUAN", (236, 72, 153)),
-        "exclusive": ("💎", "Exclusive", (59, 130, 246)),
-        "epic": ("💜", "Epic", (192, 132, 252)),
-        "rare": ("💙", "Rare", (96, 165, 250)),
-        "common": ("⚪", "Common", (156, 163, 175)),
+        "titanic": (games_emoji("titanic", "🌌"), "TITANIC", (245, 158, 11)),
+        "huge": (games_emoji("huge", "💥"), "HUGE", (168, 85, 247)),
+        "gargantuan": (games_emoji("gargantuan", "🌠"), "GARGANTUAN", (236, 72, 153)),
+        "exclusive": (games_emoji("exclusive", "💎"), "Exclusive", (59, 130, 246)),
+        "epic": (games_emoji("epic", "💜"), "Epic", (192, 132, 252)),
+        "rare": (games_emoji("rare", "💙"), "Rare", (96, 165, 250)),
+        "common": (games_emoji("common", "⚪"), "Common", (156, 163, 175)),
     }.get(tier, ("❔", str(tier).capitalize(), (156, 163, 175)))
 
 
@@ -681,7 +720,7 @@ def games_wallet_embed(target, title=None):
     total = bal["balance"] + bal["bank"]
     unlimited = " · ∞ unlimited (testing)" if games_is_unlimited(target.id) else ""
     embed = discord.Embed(
-        title=title or f"🪙 {target.display_name}'s Wallet",
+        title=title or f"{games_emoji('credits', '🪙')} {target.display_name}'s Wallet",
         color=games_color("gold"),
     )
     avatar = getattr(target, "display_avatar", None) or getattr(target, "avatar", None)
@@ -826,7 +865,7 @@ def games_shop_embed(user_id, page=0):
     start = page * GAMES_SHOP_CASE_LIMIT
     cases = all_cases[start:start + GAMES_SHOP_CASE_LIMIT]
     embed = discord.Embed(
-        title="[MCWV] Clan & Community!'s Shop",
+        title=f"{games_emoji('shop', '🛒')} [MCWV] Clan & Community!'s Shop",
         color=games_color("gold"),
         description=(
             f"**Your balance:** {d['balance']:,} credits{unlimited_txt}\n\n"
@@ -2150,12 +2189,12 @@ async def games_daily(interaction: discord.Interaction):
         bar_filled = games_bar(min(streak, 10), 10)
         milestone = {7: " 🎖 1 week!", 14: " 🏅 2 weeks!", 30: " 👑 30 days!", 100: " 💎 100 days!"}.get(streak, "")
         embed = discord.Embed(
-            title="\U0001f4c5 Daily Check-in",
+            title=f"{games_emoji('daily', '📅')} Daily Check-in",
             description=f"+{games_money(award)} added to your balance",
             color=games_color("green"),
         )
         embed.add_field(
-            name=f"Streak \u00b7 {streak} day{'s' if streak != 1 else ''}{milestone}",
+            name=f"{games_emoji('streak', '🔥')} Streak · {streak} day{'s' if streak != 1 else ''}{milestone}",
             value=f"{flames}\n`{bar_filled}`",
             inline=True,
         )
@@ -2197,7 +2236,7 @@ async def games_pay(interaction: discord.Interaction, user: discord.User, amount
     ok, res = games_coin_transfer(interaction.user.id, user.id, amount)
     if not ok:
         return await interaction.followup.send(f"❌ {res}", ephemeral=True)
-    embed = discord.Embed(title="💸 Payment Sent", description=f"{games_money(amount)} → {getattr(user, 'mention', '<@%s>' % user.id)}", color=games_color("green"))
+    embed = discord.Embed(title=f"{games_emoji('pay', '💸')} Payment Sent", description=f"{games_money(amount)} → {getattr(user, 'mention', '<@%s>' % user.id)}", color=games_color("green"))
     games_footer(embed, "/coins to check your balance")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -2219,7 +2258,7 @@ async def games_deposit(interaction: discord.Interaction, amount: str):
     ok, result = games_bank_move(uid, amt, "deposit")
     if not ok:
         return await interaction.followup.send(f"❌ {result}", ephemeral=True)
-    embed = discord.Embed(title="🏦 Deposit", description=f"{games_money(amt)} moved into your bank", color=games_color("green"))
+    embed = discord.Embed(title=f"{games_emoji('bank', '🏦')} Deposit", description=f"{games_money(amt)} moved into your bank", color=games_color("green"))
     embed.add_field(name="New bank balance", value=f"**{result['bank']:,}** 🪙", inline=True)
     embed.add_field(name="Interest", value="+1%/day (capped at 100k)", inline=True)
     games_footer(embed, "/withdraw to take it back out")
@@ -2243,7 +2282,7 @@ async def games_withdraw(interaction: discord.Interaction, amount: str):
     ok, result = games_bank_move(uid, amt, "withdraw")
     if not ok:
         return await interaction.followup.send(f"❌ {result}", ephemeral=True)
-    embed = discord.Embed(title="💵 Withdrawal", description=f"{games_money(amt)} moved to cash", color=games_color("green"))
+    embed = discord.Embed(title=f"{games_emoji('bank', '🏦')} Withdrawal", description=f"{games_money(amt)} moved to cash", color=games_color("green"))
     embed.add_field(name="New cash balance", value=f"**{result['balance']:,}** 🪙", inline=True)
     games_footer(embed, "Banked coins earn 1%/day interest")
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -2507,7 +2546,7 @@ async def games_cases(interaction: discord.Interaction):
             rows = cur.fetchall()
         if not rows:
             return await interaction.followup.send("No cases yet — staff will add some soon!", ephemeral=True)
-        embed = discord.Embed(title="🎁 Role Cases", color=games_color("violet"),
+        embed = discord.Embed(title=f"{games_emoji('case_open', '🎁')} Role Cases", color=games_color("violet"),
                               description="**Loot boxes with real Discord role prizes** — contents and odds are always shown before you roll.")
         for cid, name, price, emoji in rows:
             embed.add_field(
@@ -3647,8 +3686,9 @@ async def games_pets(interaction: discord.Interaction, user: discord.User = None
             return await interaction.followup.send(f"{target.display_name} hasn't hatched anything yet — try `/hatch`!", ephemeral=True)
         lines = []
         for name, count, _ in rows:
-            emoji = "🌌" if name.startswith("Titanic") else "🌠" if name.startswith("Gargantuan") \
-                else "💥" if name.startswith("Huge") else "🐾"
+            emoji = games_emoji("titanic", "🌌") if name.startswith("Titanic") \
+                else games_emoji("gargantuan", "🌠") if name.startswith("Gargantuan") \
+                else games_emoji("huge", "💥") if name.startswith("Huge") else games_emoji("pets", "🐾")
             lines.append(f"{emoji} **{name}** ×{count}")
         # collection completion vs the real pet database
         total_in_db = len(games_get_pets())
@@ -4123,7 +4163,7 @@ async def settle_duel(duel_id, winner_id, reason):
             else:
                 answer_txt = f" — it was **{duel.get('answer', '?')}**" if duel.get("answer") else ""
             embed = discord.Embed(
-                title="🏆 Duel Won!",
+                title=f"{games_emoji('win', '🏆')} Duel Won!",
                 description=f"<@{winner_id}> takes the pot{answer_txt} — **+{pot:,}** 🪙!",
                 color=games_color("gold"),
             )
@@ -4182,7 +4222,7 @@ async def games_duel(interaction: discord.Interaction, user: discord.User, wager
     view = DuelChallengeView(duel_id, user.id, interaction.user.id, wager, game_type)
     game_label = {'guess': '🔍 Guess the Pet', 'existcount': '🔢 Exist Count', 'scramble': '🔀 Scramble'}.get(game_type, game_type)
     duel_embed = discord.Embed(
-        title="⚔️ Duel Challenge",
+        title=f"{games_emoji('duel', '⚔️')} Duel Challenge",
         description=(
             f"**{interaction.user.mention}** challenges **{user.mention}**!\n\n"
             f"**Game:** {game_label} (bot-picked)\n"
@@ -4882,12 +4922,12 @@ async def games_spin(interaction: discord.Interaction):
     item = settlement.get("item")
     wheel_buf = games_build_wheel_image(idx)
 
-    embed = discord.Embed(title="\U0001f3a1 Spin the Wheel", color=games_color("purple"))
+    embed = discord.Embed(title=f"{games_emoji('spin', '🎡')} Spin the Wheel", color=games_color("purple"))
     if is_jackpot:
         games_track("spin", interaction.channel.id, minted=amount, burned=spin_burned)
         games_track_user("spin", interaction.user.id, win=True)
         embed.color = games_color("gold")
-        embed.title = "\U0001f3b0 JACKPOT!"
+        embed.title = f"{games_emoji('jackpot', '🎰')} JACKPOT!"
         embed.description = f"{interaction.user.mention} wins the whole **{amount:,}** coin jackpot! 🎆"
         embed.add_field(name="You won", value=games_money(amount), inline=True)
     elif amount > 0:
@@ -4908,13 +4948,13 @@ async def games_spin(interaction: discord.Interaction):
         embed.color = games_color("slate")
         embed.description = f"You landed on **{label}** \u2014 better luck next time!"
         embed.add_field(name="You won", value="nothing 😔", inline=True)
-    embed.add_field(name="\U0001f3b0 Jackpot", value=f"**{int(settlement['jackpot']):,}** 🪙", inline=True)
+    embed.add_field(name=f"{games_emoji('jackpot', '🎰')} Jackpot", value=f"**{int(settlement['jackpot']):,}** 🪙", inline=True)
     embed.add_field(name="\U0001f5d3 Spins today", value=f"{spins}/1", inline=True)
     games_footer(embed, "1 free spin per 24h window · extra spins from /shop")
     frame1 = games_build_wheel_frame(idx, -32) if wheel_buf else None
     frame2 = games_build_wheel_frame(idx, -10) if wheel_buf else None
     spin_embed = discord.Embed(
-        title="🎡 Spinning…",
+        title=f"{games_emoji('spin', '🎡')} Spinning…",
         description="The wheel is in motion — where will it land?",
         color=games_color("purple"),
     )
@@ -5020,15 +5060,15 @@ async def games_scratch(interaction: discord.Interaction):
         games_track("scratch", interaction.channel_id, burned=scratch_burned)
     games_track_user("scratch", interaction.user.id, win=award > 0)
     if best == 3:
-        result_txt = f"🎆 **TRIPLE MATCH! +{award:,}** 🪙"
+        result_txt = f"{games_emoji('win', '🎆')} **TRIPLE MATCH! +{award:,}** 🪙"
         result_color = games_color("gold")
     elif best == 2:
-        result_txt = f"✨ **Pair! +{award:,}** 🪙"
+        result_txt = f"{games_emoji('win', '✨')} **Pair! +{award:,}** 🪙"
         result_color = games_color("green")
     else:
         result_txt = "😔 No match — better luck tomorrow!"
         result_color = games_color("slate")
-    embed = discord.Embed(title="🎴 Scratch Card", color=result_color)
+    embed = discord.Embed(title=f"{games_emoji('scratch', '🎴')} Scratch Card", color=result_color)
     embed.add_field(name="Your three pets", value=f"1️⃣ {picks[0]}\n2️⃣ {picks[1]}\n3️⃣ {picks[2]}", inline=False)
     embed.add_field(name="Result", value=result_txt, inline=False)
     if pity_triggered:
@@ -5044,7 +5084,7 @@ async def games_scratch(interaction: discord.Interaction):
     strip = await games_build_scratch_strip(picks)
     covered = await games_build_scratch_strip(picks, covered=True) if strip else None
     # hidden state first — names + result only appear after the scratch reveal
-    hidden = discord.Embed(title="🎴 Scratch Card", color=games_color("amber"))
+    hidden = discord.Embed(title=f"{games_emoji('scratch', '🎴')} Scratch Card", color=games_color("amber"))
     hidden.add_field(name="Your three pets", value="1️⃣ ???\n2️⃣ ???\n3️⃣ ???", inline=False)
     hidden.add_field(name="Result", value="*scratching…*", inline=False)
     games_footer(hidden, "1 free daily · extras from /shop")
