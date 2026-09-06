@@ -1142,9 +1142,10 @@ def _ensure_cosmetic_table():
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_cosmetic_roles (
-                    discord_id BIGINT PRIMARY KEY,
+                    discord_id BIGINT NOT NULL,
                     role_id BIGINT NOT NULL,
-                    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (discord_id, role_id)
                 )
             """)
         conn.commit()
@@ -1157,7 +1158,7 @@ def _highest_cosmetic_role(roles):
     if not owned:
         return None
     # Higher = later in hierarchy list; use index as rank
-    best = max(owned, key=lambda r: COSMETIC_HIERARCHY.index(int(r.id)) if int(r.id) in COSMETIC_HIERARCHY else -1)
+    best = min(owned, key=lambda r: COSMETIC_HIERARCHY.index(int(r.id)) if int(r.id) in COSMETIC_HIERARCHY else 9999)
     return best
 
 async def record_initial_cosmetic_roles():
@@ -1200,16 +1201,15 @@ async def record_initial_cosmetic_roles():
     except Exception as e:
         print(f"[cosmetic_initial] error: {e}")
 
-def get_user_cosmetic_role(discord_id):
+def get_user_cosmetic_roles(discord_id):
     if not db_enabled() or not conn:
-        return None
+        return []
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT role_id FROM user_cosmetic_roles WHERE discord_id = %s", (int(discord_id),))
-            row = cur.fetchone()
-            return int(row[0]) if row else None
+            return [int(r[0]) for r in cur.fetchall() if r[0] is not None]
     except Exception:
-        return None
+        return []
 
 def set_user_cosmetic_role(discord_id, role_id):
     if not db_enabled() or not conn:
@@ -1220,7 +1220,7 @@ def set_user_cosmetic_role(discord_id, role_id):
             cur.execute("""
                 INSERT INTO user_cosmetic_roles (discord_id, role_id, saved_at)
                 VALUES (%s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (discord_id) DO UPDATE SET role_id = EXCLUDED.role_id, saved_at = CURRENT_TIMESTAMP
+                ON CONFLICT (discord_id, role_id) DO NOTHING
             """, (int(discord_id), int(role_id)))
         conn.commit()
         return True
@@ -2387,7 +2387,15 @@ async def games_equip(interaction: discord.Interaction):
     member = interaction.user
     if not member or not isinstance(member, discord.Member):
         return await interaction.followup.send("❌ Must be used in server.", ephemeral=True)
-    owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
+    db_owned_ids = get_user_cosmetic_roles(member.id)
+    owned = []
+    for rid in db_owned_ids:
+        r = interaction.guild.get_role(int(rid)) if interaction.guild else None
+        if r:
+            owned.append(r)
+    # Fallback to Discord roles if DB empty but they have them
+    if not owned:
+        owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
     if not owned:
         return await interaction.followup.send("❌ You don't own any cosmetic roles. Earn them from crates first.", ephemeral=True)
     embed = discord.Embed(title="🎭 Equip Cosmetic Role", description="Select one role to wear. All others will be removed automatically.", color=discord.Color.blurple())
