@@ -1172,24 +1172,31 @@ async def record_initial_cosmetic_roles():
         for member in guild.members:
             if not member or member.bot:
                 continue
-            best = _highest_cosmetic_role(member.roles)
-            if best is None:
+            owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
+            if not owned:
                 continue
-            # Remove all other cosmetics, keep only highest
-            for r in member.roles:
-                if int(r.id) in COSMETIC_ROLE_IDS and int(r.id) != int(best.id):
-                    try:
-                        await member.remove_roles(r, reason="Initial commit /equip cleanup")
-                    except Exception:
-                        pass
-            # Ensure highest is present
-            if best not in member.roles:
+            # Save ALL currently owned cosmetic roles to DB
+            for r in owned:
                 try:
-                    await member.add_roles(best, reason="Initial commit /equip auto-equip")
+                    set_user_cosmetic_role(member.id, r.id)
                 except Exception:
                     pass
-            # Save as owned / equipped
-            set_user_cosmetic_role(member.id, best.id)
+            # Auto-equip only highest hierarchy
+            best = _highest_cosmetic_role(owned)
+            if best:
+                for r in owned:
+                    if int(r.id) != int(best.id):
+                        try:
+                            await member.remove_roles(r, reason="Initial commit /equip cleanup")
+                        except Exception:
+                            pass
+                if best not in member.roles:
+                    try:
+                        await member.add_roles(best, reason="Initial commit /equip auto-equip")
+                    except Exception:
+                        pass
+                # Ensure DB reflects equipped (highest) too
+                set_user_cosmetic_role(member.id, best.id)
     except Exception as e:
         print(f"[cosmetic_initial] error: {e}")
 
@@ -8376,6 +8383,7 @@ class GameStaffRoleView(discord.ui.View):
     app_commands.Choice(name="spawn channel remove", value="spawn_remove"),
     app_commands.Choice(name="spawn channels list", value="spawn_list"),
     app_commands.Choice(name="sync pets+eggs", value="sync"),
+    app_commands.Choice(name="equip sync (scan cosmetic roles)", value="equipsync"),
     app_commands.Choice(name="interest rate", value="interest"),
     app_commands.Choice(name="jackpot seed", value="jackpot"),
     app_commands.Choice(name="game role", value="role"),
@@ -8559,6 +8567,15 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         except Exception:
             chans = []
         return await interaction.followup.send("Spawn channels: " + (" ".join(f"<#{c}>" for c in chans) if chans else "none set"), ephemeral=True)
+
+    if action == "equipsync":
+        await interaction.followup.send("⏳ Running cosmetic role sync (all owned roles saved, highest auto-equipped)...", ephemeral=True)
+        try:
+            await record_initial_cosmetic_roles()
+            await interaction.followup.send("✅ Cosmetic sync complete — all members scanned; DB saved.", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Synch failed: {exc}", ephemeral=True)
+        return
 
     if action == "sync":
         await interaction.followup.send("🔄 Syncing the real pet/egg database…", ephemeral=True)
@@ -9000,7 +9017,7 @@ async def on_ready():
     if not getattr(bot, "_games_commands_synced", False):
         synced = await bot.tree.sync(guild=guild_obj)
         bot._games_commands_synced = True
-        print(f"[discord] synced {len(synced)} MCWV Games commands")
+        print(f"[discord] synced {len(synced)} MCWV Games commands"); print("[DEBUG] Sync list includes equip? "+str(any("equipsync" in str(s.name) for s in (synced or []))))
     if not games_housekeeping_loop.is_running():
         games_housekeeping_loop.start()
     if not games_event_loop_watchdog.is_running():
