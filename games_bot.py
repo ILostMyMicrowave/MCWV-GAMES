@@ -1,4 +1,4 @@
-e
+
 """MCWV Games — standalone Discord games/economy bot.
 
 This service intentionally contains no clan, ticket, application, invite,
