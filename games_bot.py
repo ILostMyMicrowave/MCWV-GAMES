@@ -2828,8 +2828,20 @@ class CaseConfirmView(discord.ui.View):
                 duplicate_credit = max(1, self.price // 2)
                 games_coin_adjust(member.id, duplicate_credit, "case_duplicate", meta={"case": self.case_name, "role": won.id})
             elif isinstance(member, discord.Member):
-                await member.add_roles(won, reason=f"Unboxed from case '{self.case_name}'")
-                role_granted = True
+                if int(won.id) in COSMETIC_ROLE_IDS:
+                    # Cosmetic: save to list, don't auto-equip — use /equip
+                    set_user_cosmetic_role(member.id, int(won.id))
+                    role_granted = True
+                    # Send reminder message (if interaction available; else skip silent)
+                    try:
+                        await interaction.followup.send(
+                            f"🎭 **{won.name}** added to your cosmetic list! Run `/equip` to wear it.", ephemeral=True
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await member.add_roles(won, reason=f"Unboxed from case '{self.case_name}'")
+                    role_granted = True
             with conn.cursor() as cur:
                 cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, won_role_id, price_paid) VALUES (%s,%s,%s,%s)",
                             (self.case_id, interaction.user.id, won.id, self.price))
@@ -9037,3 +9049,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+@bot.tree.command(name="equipsync", description="Owner only: scan members and equip highest cosmetic role", guild=guild_obj)
+async def games_equip_sync(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.user.id not in OWNER_IDS:
+        return await interaction.followup.send("❌ Owner only.", ephemeral=True)
+    await interaction.followup.send("⏳ Running cosmetic sync...", ephemeral=True)
+    await record_initial_cosmetic_roles()
+    await interaction.followup.send("✅ Cosmetic sync complete — highest owned role equipped for all members; DB saved.", ephemeral=True)
