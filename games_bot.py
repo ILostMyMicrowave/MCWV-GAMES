@@ -1133,6 +1133,72 @@ def games_staff_role_ids():
     return role_ids
 
 
+
+
+def _ensure_cosmetic_table():
+    if not db_enabled() or not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_cosmetic_roles (
+                    discord_id BIGINT PRIMARY KEY,
+                    role_id BIGINT NOT NULL,
+                    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        conn.commit()
+    except Exception as e:
+        print(f"[cosmetic_table] init error: {e}")
+
+def record_initial_cosmetic_roles():
+    """Scan all members and record currently-held cosmetic roles as owned."""
+    if not db_enabled() or not conn:
+        return
+    _ensure_cosmetic_table()
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+        for member in guild.members:
+            if not member or member.bot:
+                continue
+            for r in member.roles:
+                if int(r.id) in COSMETIC_ROLE_IDS:
+                    set_user_cosmetic_role(member.id, r.id)
+                    break
+    except Exception as e:
+        print(f"[cosmetic_initial] error: {e}")
+
+def get_user_cosmetic_role(discord_id):
+    if not db_enabled() or not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT role_id FROM user_cosmetic_roles WHERE discord_id = %s", (int(discord_id),))
+            row = cur.fetchone()
+            return int(row[0]) if row else None
+    except Exception:
+        return None
+
+def set_user_cosmetic_role(discord_id, role_id):
+    if not db_enabled() or not conn:
+        return False
+    _ensure_cosmetic_table()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_cosmetic_roles (discord_id, role_id, saved_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (discord_id) DO UPDATE SET role_id = EXCLUDED.role_id, saved_at = CURRENT_TIMESTAMP
+            """, (int(discord_id), int(role_id)))
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"[cosmetic_set] error: {e}")
+        return False
+
 def games_set_staff_role_ids(role_ids):
     """Persist the exact game-staff role set. Returns (ok, ids/error)."""
     ids = sorted({int(rid) for rid in (role_ids or []) if int(rid) > 0})[:25]
@@ -2217,6 +2283,52 @@ async def games_daily(interaction: discord.Interaction):
         print(f"[games] daily failed: {exc}")
         await interaction.followup.send("❌ Something went wrong claiming your daily.", ephemeral=True)
 
+
+
+
+COSMETIC_ROLE_IDS = {
+    1531794083956265040, 1539169801979691058, 1537438565128994926,
+    1529531398161957118, 1539169718689341490, 1537439714582335498,
+    1525108109956354068, 1539169605396992001, 1537439051831971931,
+    1519468278374862939,
+}
+
+@bot.tree.command(name="equip", description="Equip one cosmetic role and remove others. Only roles you have earned can be selected.", guild=guild_obj)
+@app_commands.describe(role="The cosmetic role to equip (must be earned from crates)")
+async def games_equip(interaction: discord.Interaction, role: discord.Role = None):
+    await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("❌ Not allowed.", ephemeral=True)
+    member = interaction.user
+    if not member or not isinstance(member, discord.Member):
+        return await interaction.followup.send("❌ Must be used in server.", ephemeral=True)
+    if not role:
+        return await interaction.followup.send("❌ Provide a role to equip.", ephemeral=True)
+    # Must be a cosmetic role
+    if int(role.id) not in COSMETIC_ROLE_IDS:
+        return await interaction.followup.send("❌ That is not a cosmetic role.", ephemeral=True)
+    # User must currently have the role to equip it (must have earned it)
+    if role not in member.roles:
+        return await interaction.followup.send("❌ You don't have that role — earn it from crates first, then use `/equip`.", ephemeral=True)
+    # Auto-remove all other cosmetic roles
+    removed = []
+    for r in member.roles:
+        if int(r.id) in COSMETIC_ROLE_IDS and int(r.id) != int(role.id):
+            try:
+                await member.remove_roles(r, reason="Auto-cleanup via /equip")
+                removed.append(r.name)
+            except Exception:
+                pass
+    # Ensure selected is assigned (in case it was lost)
+    if role not in member.roles:
+        try:
+            await member.add_roles(role, reason="Equipped via /equip")
+        except Exception as exc:
+            return await interaction.followup.send(f"❌ Could not add role: {exc}", ephemeral=True)
+    # Save record
+    ok = set_user_cosmetic_role(member.id, role.id)
+    removed_text = f" Removed others: {', '.join(removed)}." if removed else ""
+    await interaction.followup.send(f"✅ Equipped role. Use /equip to switch later.", ephemeral=True)
 
 @bot.tree.command(name="pay", description="Send coins to another member", guild=guild_obj)
 @app_commands.describe(user="Who to pay", amount="Amount (min 10)")
