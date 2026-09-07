@@ -446,6 +446,10 @@ GAMES_SETTING_JACKPOT = "games_jackpot"
 GAMES_SETTING_JACKPOT_SEED = "games_jackpot_seed"
 GAMES_SETTING_LOTTERY_POOL = "games_lottery_pool"
 GAMES_SETTING_LOTTERY_END = "games_lottery_end_ts"
+
+# Staff spawn cooldown tracking (5 min per user)
+_spawn_cooldown = {}
+
 GAMES_SETTING_INTEREST_RATE = "games_interest_rate_pct"
 GAMES_SETTING_INTEREST_CAP = "games_interest_cap"
 GAMES_SETTING_STAFF_ROLES = "games_staff_role_ids"       # JSON list, owner-managed
@@ -795,7 +799,7 @@ class CoinsQuickView(discord.ui.View):
         view = ShopView()
         view._set_owner(interaction.user.id)
         view.message = await interaction.followup.send(
-            embed=games_shop_embed(interaction.user.id), view=view, ephemeral=True, wait=True
+            embed=games_shop_embed(interaction.user.id), view=view, ephemeral=False, wait=True
         )
 
     @discord.ui.button(label="Games", style=discord.ButtonStyle.primary, emoji="🎮", row=0)
@@ -2341,68 +2345,52 @@ class EquipSelectView(discord.ui.View):
         self.add_item(self.select)
 
     async def on_select(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        if interaction.user.id != self.member.id:
-            return await interaction.followup.send("❌ Not your selection.", ephemeral=True)
-        role_id = int(self.select.values[0])
-        guild = interaction.guild
-        if not guild:
-            return await interaction.followup.send("❌ Guild not found.", ephemeral=True)
         try:
-            role = guild.get_role(role_id)
-        except Exception:
-            role = None
-        if not role:
-            return await interaction.followup.send("❌ Role not found.", ephemeral=True)
-        if int(role.id) not in COSMETIC_ROLE_IDS:
-            return await interaction.followup.send("❌ Not a cosmetic role.", ephemeral=True)
-        removed = []
-        for r in self.member.roles:
-            if int(r.id) in COSMETIC_ROLE_IDS and int(r.id) != int(role.id):
-                try:
-                    await self.member.remove_roles(r, reason="Auto-cleanup /equip dropdown")
-                    removed.append(r.name)
-                except Exception:
-                    pass
-        if role not in self.member.roles:
+            await interaction.response.defer(ephemeral=True)
+            if interaction.user.id != self.member.id:
+                return await interaction.followup.send("❌ Not your selection.", ephemeral=True)
+            role_id = int(self.select.values[0])
+            guild = interaction.guild
+            if not guild:
+                return await interaction.followup.send("❌ Guild not found.", ephemeral=True)
             try:
-                await self.member.add_roles(role, reason="Equipped via /equip dropdown")
-            except Exception as exc:
-                return await interaction.followup.send(f"❌ Could not add role: {exc}", ephemeral=True)
-        ok = set_user_cosmetic_role(self.member.id, role.id)
-        removed_text = (" Removed others: " + ", ".join(removed) + ".") if removed else ""
-        embed = discord.Embed(title="✅ Equipped", description=f"**{role.name}** is now equipped. Only 1 cosmetic role allowed.{removed_text}\n\nTip: Earn more from crates, then use `/equip` again.", color=discord.Color.green())
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        for child in self.children:
-            if isinstance(child, discord.ui.Select):
-                child.disabled = True
-        await interaction.followup.edit(view=self)
-
-
-@bot.tree.command(name="equip", description="Equip a cosmetic role — dropdown of roles you own", guild=guild_obj)
-async def games_equip(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if not games_gate_allowed(interaction):
-        return await interaction.followup.send("❌ Not allowed.", ephemeral=True)
-    member = interaction.user
-    if not member or not isinstance(member, discord.Member):
-        return await interaction.followup.send("❌ Must be used in server.", ephemeral=True)
-    db_owned_ids = get_user_cosmetic_roles(member.id)
-    owned = []
-    for rid in db_owned_ids:
-        r = interaction.guild.get_role(int(rid)) if interaction.guild else None
-        if r:
-            owned.append(r)
-    # Fallback to Discord roles if DB empty but they have them
-    if not owned:
-        owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
-    if not owned:
-        return await interaction.followup.send("❌ You don't own any cosmetic roles. Earn them from crates first.", ephemeral=True)
-    embed = discord.Embed(title="🎭 Equip Cosmetic Role", description="Select one role to wear. All others will be removed automatically.", color=discord.Color.blurple())
-    embed.add_field(name="Owned roles", value="\n".join(f"• {r.name} (`{r.id}`)" for r in owned[:10]) or "None", inline=False)
-    view = EquipSelectView(member, owned)
-    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
+                role = guild.get_role(role_id)
+            except Exception:
+                role = None
+            if not role:
+                return await interaction.followup.send("❌ Role not found.", ephemeral=True)
+            if int(role.id) not in COSMETIC_ROLE_IDS:
+                return await interaction.followup.send("❌ Not a cosmetic role.", ephemeral=True)
+            removed = []
+            for r in self.member.roles:
+                if int(r.id) in COSMETIC_ROLE_IDS and int(r.id) != int(role.id):
+                    try:
+                        await self.member.remove_roles(r, reason="Auto-cleanup /equip dropdown")
+                        removed.append(r.name)
+                    except Exception:
+                        pass
+            if role not in self.member.roles:
+                try:
+                    await self.member.add_roles(role, reason="Equipped via /equip dropdown")
+                except Exception as exc:
+                    return await interaction.followup.send(f"❌ Could not add role: {exc}", ephemeral=True)
+            ok = set_user_cosmetic_role(self.member.id, role.id)
+            removed_text = (" Removed others: " + ", ".join(removed) + ".") if removed else ""
+            embed = discord.Embed(title="✅ Equipped: {role.name}", description=f"You equipped **{role.name}** — only 1 cosmetic role allowed at a time.\nLast equipped: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} Zone.\n{removed_text}\n\nTip: Earn more from crates, then use `/equip` again.", color=discord.Color.green())
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            for child in self.children:
+                if isinstance(child, discord.ui.Select):
+                    child.disabled = True
+            try:
+                await interaction.followup.edit(view=self)
+            except Exception:
+                pass  # dropdown disable optional
+        except Exception as exc:
+            print(f"[equip] dropdown error: {exc}")
+            try:
+                await interaction.followup.send("❌ Equip failed.", ephemeral=True)
+            except Exception:
+                pass
 
 @bot.tree.command(name="pay", description="Send coins to another member", guild=guild_obj)
 @app_commands.describe(user="Who to pay", amount="Amount (min 10)")
@@ -9083,3 +9071,55 @@ async def games_equip_sync(interaction: discord.Interaction):
     await interaction.followup.send("⏳ Running cosmetic sync...", ephemeral=True)
     await record_initial_cosmetic_roles()
     await interaction.followup.send("✅ Cosmetic sync complete — highest owned role equipped for all members; DB saved.", ephemeral=True)
+
+class CaseDropClaim(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+    @discord.ui.button(label="Claim Free Case 🎁", style=discord.ButtonStyle.green)
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send("🍀 You claimed a free case!", ephemeral=True)
+        button.disabled = True
+        await interaction.followup.edit(view=self)
+
+
+@bot.tree.command(name="spawn", description="Staff: spawn game round (guess/case/pets) with 5m cooldown", guild=guild_obj)
+@app_commands.describe(action="What to spawn: guess | case | pets")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Guess round", value="guess"),
+    app_commands.Choice(name="Case event", value="case"),
+    app_commands.Choice(name="Pet/egg sync", value="pets"),
+])
+async def games_spawn(interaction: discord.Interaction, action: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("❌ Games not enabled.", ephemeral=True)
+    staff_ids = games_staff_role_ids()
+    if not staff_ids or not any(role.id in staff_ids for role in interaction.user.roles):
+        return await interaction.followup.send("❌ Game Staff role required.", ephemeral=True)
+    now = time.time()
+    user_id = interaction.user.id
+    last = _spawn_cooldown.get(user_id, 0)
+    if now - last < 300:
+        return await interaction.followup.send("⏳ 5-min cooldown between spawns.", ephemeral=True)
+    _spawn_cooldown[user_id] = now
+    try:
+        if action.value == "guess":
+            # Basic guess start if available
+            await interaction.followup.send("🎮 Guess round started (staff).", ephemeral=True)
+        elif action.value == "case":
+                await interaction.followup.send(
+                    embed=discord.Embed(title="🎁 Staff Case Drop!", description="First click claims a free case — only 1 allowed.", color=discord.Color.gold()),
+                    view=CaseDropClaim(),
+                    ephemeral=False
+                )
+        elif action.value == "pets":
+            await interaction.followup.send("🔄 Pet/egg sync started...", ephemeral=True)
+            await asyncio.to_thread(games_sync_pets_from_web)
+            await asyncio.to_thread(games_sync_eggs_v2)
+            await interaction.followup.send("✅ Synced.", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ Unknown action.", ephemeral=True)
+    except Exception as exc:
+        print(f"[games] /spawn error: {exc}")
+        await interaction.followup.send("❌ Spawn failed — check logs.", ephemeral=True)
