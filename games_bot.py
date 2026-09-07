@@ -2691,6 +2691,68 @@ class ShopView(discord.ui.View):
         )
 
 
+@bot.tree.command(name="equipsync", description="Owner only: scan members and equip highest cosmetic role", guild=guild_obj)
+async def games_equip_sync(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.user.id not in OWNER_IDS:
+        return await interaction.followup.send("❌ Owner only.", ephemeral=True)
+    await interaction.followup.send("⏳ Running cosmetic sync...", ephemeral=True)
+    await record_initial_cosmetic_roles()
+    await interaction.followup.send("✅ Cosmetic sync complete — highest owned role equipped for all members; DB saved.", ephemeral=True)
+
+class CaseDropClaim(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+    @discord.ui.button(label="Claim Free Case 🎁", style=discord.ButtonStyle.green)
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send("🍀 You claimed a free case!", ephemeral=True)
+        button.disabled = True
+        await interaction.followup.edit(view=self)
+
+
+@bot.tree.command(name="spawn", description="Staff: spawn game round (guess/case/pets) with 5m cooldown", guild=guild_obj)
+@app_commands.describe(action="What to spawn: guess | case | pets")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Guess round", value="guess"),
+    app_commands.Choice(name="Case event", value="case"),
+    app_commands.Choice(name="Pet/egg sync", value="pets"),
+])
+async def games_spawn(interaction: discord.Interaction, action: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("❌ Games not enabled.", ephemeral=True)
+    staff_ids = games_staff_role_ids()
+    if not staff_ids or not any(role.id in staff_ids for role in interaction.user.roles):
+        return await interaction.followup.send("❌ Game Staff role required.", ephemeral=True)
+    now = time.time()
+    user_id = interaction.user.id
+    last = _spawn_cooldown.get(user_id, 0)
+    if now - last < 300:
+        return await interaction.followup.send("⏳ 5-min cooldown between spawns.", ephemeral=True)
+    _spawn_cooldown[user_id] = now
+    try:
+        if action.value == "guess":
+            # Basic guess start if available
+            await interaction.followup.send("🎮 Guess round started (staff).", ephemeral=True)
+        elif action.value == "case":
+                await interaction.followup.send(
+                    embed=discord.Embed(title="🎁 Staff Case Drop!", description="First click claims a free case — only 1 allowed.", color=discord.Color.gold()),
+                    view=CaseDropClaim(),
+                    ephemeral=False
+                )
+        elif action.value == "pets":
+            await interaction.followup.send("🔄 Pet/egg sync started...", ephemeral=True)
+            await asyncio.to_thread(games_sync_pets_from_web)
+            await asyncio.to_thread(games_sync_eggs_v2)
+            await interaction.followup.send("✅ Synced.", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ Unknown action.", ephemeral=True)
+    except Exception as exc:
+        print(f"[games] /spawn error: {exc}")
+        await interaction.followup.send("❌ Spawn failed — check logs.", ephemeral=True)
+
+
 @bot.tree.command(name="shop", description="Buy game items with coins", guild=guild_obj)
 async def games_shop(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -9063,63 +9125,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-@bot.tree.command(name="equipsync", description="Owner only: scan members and equip highest cosmetic role", guild=guild_obj)
-async def games_equip_sync(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if interaction.user.id not in OWNER_IDS:
-        return await interaction.followup.send("❌ Owner only.", ephemeral=True)
-    await interaction.followup.send("⏳ Running cosmetic sync...", ephemeral=True)
-    await record_initial_cosmetic_roles()
-    await interaction.followup.send("✅ Cosmetic sync complete — highest owned role equipped for all members; DB saved.", ephemeral=True)
-
-class CaseDropClaim(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=600)
-    @discord.ui.button(label="Claim Free Case 🎁", style=discord.ButtonStyle.green)
-    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send("🍀 You claimed a free case!", ephemeral=True)
-        button.disabled = True
-        await interaction.followup.edit(view=self)
-
-
-@bot.tree.command(name="spawn", description="Staff: spawn game round (guess/case/pets) with 5m cooldown", guild=guild_obj)
-@app_commands.describe(action="What to spawn: guess | case | pets")
-@app_commands.choices(action=[
-    app_commands.Choice(name="Guess round", value="guess"),
-    app_commands.Choice(name="Case event", value="case"),
-    app_commands.Choice(name="Pet/egg sync", value="pets"),
-])
-async def games_spawn(interaction: discord.Interaction, action: app_commands.Choice[str]):
-    await interaction.response.defer(ephemeral=True)
-    if not games_gate_allowed(interaction):
-        return await interaction.followup.send("❌ Games not enabled.", ephemeral=True)
-    staff_ids = games_staff_role_ids()
-    if not staff_ids or not any(role.id in staff_ids for role in interaction.user.roles):
-        return await interaction.followup.send("❌ Game Staff role required.", ephemeral=True)
-    now = time.time()
-    user_id = interaction.user.id
-    last = _spawn_cooldown.get(user_id, 0)
-    if now - last < 300:
-        return await interaction.followup.send("⏳ 5-min cooldown between spawns.", ephemeral=True)
-    _spawn_cooldown[user_id] = now
-    try:
-        if action.value == "guess":
-            # Basic guess start if available
-            await interaction.followup.send("🎮 Guess round started (staff).", ephemeral=True)
-        elif action.value == "case":
-                await interaction.followup.send(
-                    embed=discord.Embed(title="🎁 Staff Case Drop!", description="First click claims a free case — only 1 allowed.", color=discord.Color.gold()),
-                    view=CaseDropClaim(),
-                    ephemeral=False
-                )
-        elif action.value == "pets":
-            await interaction.followup.send("🔄 Pet/egg sync started...", ephemeral=True)
-            await asyncio.to_thread(games_sync_pets_from_web)
-            await asyncio.to_thread(games_sync_eggs_v2)
-            await interaction.followup.send("✅ Synced.", ephemeral=True)
-        else:
-            await interaction.followup.send("❌ Unknown action.", ephemeral=True)
-    except Exception as exc:
-        print(f"[games] /spawn error: {exc}")
-        await interaction.followup.send("❌ Spawn failed — check logs.", ephemeral=True)
