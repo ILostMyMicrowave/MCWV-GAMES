@@ -2725,12 +2725,9 @@ async def games_spawn(interaction: discord.Interaction, action: app_commands.Cho
     staff_ids = games_staff_role_ids()
     if not staff_ids or not any(role.id in staff_ids for role in interaction.user.roles):
         return await interaction.followup.send("❌ Game Staff role required.", ephemeral=True)
-    now = time.time()
-    user_id = interaction.user.id
-    last = _spawn_cooldown.get(user_id, 0)
-    if now - last < 300:
-        return await interaction.followup.send("⏳ 5-min cooldown between spawns.", ephemeral=True)
-    _spawn_cooldown[user_id] = now
+    # No per-user cooldown; allow spawning if no active event running (simple global check)
+    # If you want to prevent overlap, check if any event is active
+    pass
     try:
         if action.value == "guess":
             # Basic guess start if available
