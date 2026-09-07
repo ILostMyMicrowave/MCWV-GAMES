@@ -1139,6 +1139,17 @@ def games_staff_role_ids():
 
 
 
+def _ensure_case_claim_table():
+    if not db_enabled() or not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS user_case_claim (discord_id BIGINT PRIMARY KEY, claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        conn.commit()
+    except Exception as e:
+        print(f"[case_claim_table] error: {e}")
+
+
 def _ensure_cosmetic_table():
     if not db_enabled() or not conn:
         return
@@ -2347,6 +2358,19 @@ class EquipSelectView(discord.ui.View):
     async def on_select(self, interaction: discord.Interaction):
         try:
             await interaction.response.defer(ephemeral=True)
+            # Only one global claim allowed; check DB first (simple guard)
+            db_claim_done = False
+            try:
+                _ensure_case_claim_table()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM user_case_claim WHERE discord_id = %s", (interaction.user.id,))
+                    if cur.fetchone():
+                        db_claim_done = True
+            except Exception:
+                pass
+            if db_claim_done:
+                await interaction.followup.send("❌ This free case was already claimed by someone else!", ephemeral=True)
+                return
             if interaction.user.id != self.member.id:
                 return await interaction.followup.send("❌ Not your selection.", ephemeral=True)
             role_id = int(self.select.values[0])
@@ -2706,9 +2730,13 @@ class CaseDropClaim(discord.ui.View):
     @discord.ui.button(label="Claim Free Case 🎁", style=discord.ButtonStyle.green)
     async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send("🍀 You claimed a free case!", ephemeral=True)
+        await interaction.followup.send("🍀 You claimed a free case! Enjoy your reward!", ephemeral=False)
         button.disabled = True
-        await interaction.followup.edit(view=self)
+        try:
+            # Update display to show disabled button (ignore if edit fails)
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
 
 
 @bot.tree.command(name="spawn", description="Staff: spawn game round (guess/case/pets) with 5m cooldown", guild=guild_obj)
