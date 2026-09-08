@@ -2730,7 +2730,7 @@ class CaseDropClaim(discord.ui.View):
     @discord.ui.button(label="Claim Free Case 🎁", style=discord.ButtonStyle.green)
     async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send("🍀 You claimed a free case! Enjoy your reward!", ephemeral=False)
+        await interaction.followup.send("🍀 You claimed a free case! Head to /shop to open it!", ephemeral=False)
         button.disabled = True
         try:
             # Update display to show disabled button (ignore if edit fails)
@@ -2777,6 +2777,58 @@ async def games_spawn(interaction: discord.Interaction, action: app_commands.Cho
         print(f"[games] /spawn error: {exc}")
         await interaction.followup.send("❌ Spawn failed — check logs.", ephemeral=True)
 
+
+
+
+@bot.tree.command(name="equip", description="Equip your cosmetic role (DB list)", guild=guild_obj)
+@app_commands.describe(action="What to do")
+async def games_equip(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not games_gate_allowed(interaction):
+        return await interaction.followup.send("❌ Not allowed.", ephemeral=True)
+    member = interaction.user
+    if not member or not isinstance(member, discord.Member):
+        return await interaction.followup.send("❌ Must be used in server.", ephemeral=True)
+    db_owned_ids = get_user_cosmetic_roles(member.id)
+    if not db_owned_ids:
+        # fallback to Discord roles
+        owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
+    else:
+        owned = []
+        guild = interaction.guild
+        for rid in db_owned_ids:
+            try:
+                r = guild.get_role(int(rid)) if guild else None
+                if r:
+                    owned.append(r)
+            except Exception:
+                pass
+    if not owned:
+        return await interaction.followup.send("❌ You don't own any cosmetic roles. Earn them from crates first!", ephemeral=True)
+    # Use highest hierarchy from owned
+    best = None
+    best_idx = float('inf')
+    for r in owned:
+        try:
+            idx = COSMETIC_HIERARCHY.index(int(r.id))
+            if idx < best_idx:
+                best_idx = idx
+                best = r
+        except ValueError:
+            continue
+    if best and best not in member.roles:
+        try:
+            await member.add_roles(best, reason="Equipped via /equip")
+        except Exception:
+            pass
+    # Mark selected in DB (optional: could save best specifically; already saved)
+    try:
+        set_user_cosmetic_role(member.id, best.id if best else (owned[0].id if owned else 0))
+    except Exception:
+        pass
+    # Build embed with current owned list
+    embed = discord.Embed(title="🎭 Equip Cosmetic", description=f"Your owned cosmetic roles (highest selected): {', '.join(r.name for r in owned[:10]) or 'None'}", color=discord.Color.blue())
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="shop", description="Buy game items with coins", guild=guild_obj)
 async def games_shop(interaction: discord.Interaction):
