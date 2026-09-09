@@ -114,7 +114,20 @@ def _run_serialized_db(fn, *args, **kwargs):
 
 
 async def async_db(fn, *args, **kwargs):
-    """Run blocking DB helper `fn` off the event loop (serialised on `conn`)."""
+    """Run blocking DB helper `fn` off the event loop (serialised on `conn`).
+
+    Pass the helper BY REFERENCE: async_db(games_coin_balance, user_id).
+    The call-expression form async_db(games_coin_balance(user_id)) is a bug:
+    the helper would run synchronously on the event loop and its RESULT
+    would be called as a function (TypeError: 'str'/'NoneType' object is
+    not callable). The guard below keeps a stray site from crashing the
+    request — it passes the already-computed value through and logs it.
+    """
+    if not callable(fn):
+        print(f"[games] async_db given non-callable {type(fn).__name__} — a helper "
+              f"ran on the event loop (call-expression form). Caller:")
+        print("".join(traceback.format_stack(limit=3)[:-1]))
+        return fn
     return await asyncio.to_thread(_run_serialized_db, fn, *args, **kwargs)
 
 # Database-backed settings are read frequently by gates and component checks.
@@ -963,9 +976,9 @@ def games_shop_embed(user_id, page=0):
 
 async def games_hub_embed(user):
     """The /games hub card (also reused by quick views)."""
-    bal = await async_db(games_coin_balance(user.id))
-    featured_slug = await async_db(games_featured_egg())
-    _dbv1_933 = await async_db(games_get_eggs())
+    bal = await async_db(games_coin_balance, user.id)
+    featured_slug = await async_db(games_featured_egg)
+    _dbv1_933 = await async_db(games_get_eggs)
     featured = next((e for e in _dbv1_933 if e["slug"] == featured_slug), None)
     _claimed = await games_daily_claimed(user.id)
     if _claimed is None:
@@ -995,7 +1008,7 @@ async def games_hub_embed(user):
     embed.add_field(name="🎡 Spins today", value=spins_txt, inline=True)
     scratch_used, _, _scratch_reset = await async_db(games_free_status, user.id, "scratch")
     tower_used, _, tower_reset = await async_db(games_free_status, user.id, "tower")
-    _dbv1_962 = await async_db(games_petdle_solved_today(user.id))
+    _dbv1_962 = await async_db(games_petdle_solved_today, user.id)
     petdle_state = "✅ solved" if _dbv1_962 else "`/petdle`"
     embed.add_field(name="🐾 Petdle today", value=petdle_state, inline=True)
     embed.add_field(name="🎴 Scratch today", value=f"`{scratch_used}/1` free", inline=True)
@@ -1008,7 +1021,7 @@ async def games_hub_embed(user):
         value=f"**{featured['name']}** — top-tier odds doubled!" if featured else "—",
         inline=False,
     )
-    _dbv1_976 = await async_db(games_jackpot_get())
+    _dbv1_976 = await async_db(games_jackpot_get)
     embed.add_field(
         name="🎰 Progressive jackpot",
         value=f"**{_dbv1_976:,}** 🪙 — hit it on `/spin`!",
@@ -1172,7 +1185,7 @@ async def games_top_embed(user_id, games=None):
         description="\n".join(lines),
         color=games_color("gold"),
     )
-    rank = await async_db(games_coin_rank(user_id))
+    rank = await async_db(games_coin_rank, user_id)
     if rank:
         embed.set_footer(text=f"Your rank: #{rank} · /daily, games, duels and bank interest all pay")
     return embed
@@ -1260,7 +1273,7 @@ async def record_initial_cosmetic_roles():
     """Scan all members: equip only highest owned cosmetic, save to DB, remove others."""
     if not db_enabled() or not conn:
         return
-    await async_db(_ensure_cosmetic_table())
+    await async_db(_ensure_cosmetic_table)
     try:
         guild = bot.get_guild(GUILD_ID)
         if not guild:
@@ -1274,7 +1287,7 @@ async def record_initial_cosmetic_roles():
             # Save ALL currently owned cosmetic roles to DB
             for r in owned:
                 try:
-                    await async_db(set_user_cosmetic_role(member.id, r.id))
+                    await async_db(set_user_cosmetic_role, member.id, r.id)
                 except Exception:
                     pass
             # Auto-equip only highest hierarchy
@@ -1292,7 +1305,7 @@ async def record_initial_cosmetic_roles():
                     except Exception:
                         pass
                 # Ensure DB reflects equipped (highest) too
-                await async_db(set_user_cosmetic_role(member.id, best.id))
+                await async_db(set_user_cosmetic_role, member.id, best.id)
     except Exception as e:
         print(f"[cosmetic_initial] error: {e}")
 
@@ -2609,7 +2622,7 @@ async def games_daily(interaction: discord.Interaction):
             await async_db(_db_step)
         except Exception as log_exc:
             print(f"[games] daily log failed: {log_exc}")
-        await async_db(games_track("daily", interaction.channel_id, minted=award))
+        await async_db(games_track, "daily", interaction.channel_id, minted=award)
         flames = "\U0001f525" * min(streak, 10)
         bar_filled = games_bar(min(streak, 10), 10)
         milestone = {7: " 🎖 1 week!", 14: " 🏅 2 weeks!", 30: " 👑 30 days!", 100: " 💎 100 days!"}.get(streak, "")
@@ -2715,7 +2728,7 @@ class EquipSelectView(discord.ui.View):
             # Only one global claim allowed; check DB first (simple guard)
             db_claim_done = False
             try:
-                await async_db(_ensure_case_claim_table())
+                await async_db(_ensure_case_claim_table)
                 def _db_step():
                     try:
                         with conn.cursor() as cur:
@@ -2762,7 +2775,7 @@ class EquipSelectView(discord.ui.View):
                     await self.member.add_roles(role, reason="Equipped via /equip dropdown")
                 except Exception as exc:
                     return await interaction.followup.send(f"❌ Could not add role: {exc}", ephemeral=True)
-            _dbv1_2409 = await async_db(set_user_cosmetic_role(self.member.id, role.id))
+            _dbv1_2409 = await async_db(set_user_cosmetic_role, self.member.id, role.id)
             if not _dbv1_2409:
                 # Role was granted on Discord; the DB mark failed. Tell the user
                 # rather than swallowing it (the /equip dropdown would re-offer
@@ -2803,7 +2816,7 @@ async def games_pay(interaction: discord.Interaction, user: discord.User, amount
         return await interaction.followup.send("❌ You can't pay yourself!", ephemeral=True)
     if getattr(user, "bot", False):
         return await interaction.followup.send("❌ Bots can't receive game coins.", ephemeral=True)
-    ok, res = await async_db(games_coin_transfer(interaction.user.id, user.id, amount))
+    ok, res = await async_db(games_coin_transfer, interaction.user.id, user.id, amount)
     if not ok:
         return await interaction.followup.send(f"❌ {res}", ephemeral=True)
     embed = discord.Embed(title=f"{games_emoji('pay', '💸')} Payment Sent", description=f"{games_money(amount)} → {getattr(user, 'mention', '<@%s>' % user.id)}", color=games_color("green"))
@@ -2818,14 +2831,14 @@ async def games_deposit(interaction: discord.Interaction, amount: str):
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     uid = interaction.user.id
-    bal = await async_db(games_coin_balance(uid))
+    bal = await async_db(games_coin_balance, uid)
     try:
         amt = bal["balance"] if str(amount).strip().lower() == "all" else int(amount)
     except (ValueError, TypeError):
         return await interaction.followup.send("❌ Amount must be a whole number or `all`.", ephemeral=True)
     if amt <= 0 or amt > GAMES_MAX_TRANSACTION:
         return await interaction.followup.send(f"❌ Amount must be between 1 and {GAMES_MAX_TRANSACTION:,}.", ephemeral=True)
-    ok, result = await async_db(games_bank_move(uid, amt, "deposit"))
+    ok, result = await async_db(games_bank_move, uid, amt, "deposit")
     if not ok:
         return await interaction.followup.send(f"❌ {result}", ephemeral=True)
     embed = discord.Embed(title=f"{games_emoji('bank', '🏦')} Deposit", description=f"{games_money(amt)} moved into your bank", color=games_color("green"))
@@ -2842,14 +2855,14 @@ async def games_withdraw(interaction: discord.Interaction, amount: str):
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     uid = interaction.user.id
-    bal = await async_db(games_coin_balance(uid))
+    bal = await async_db(games_coin_balance, uid)
     try:
         amt = bal["bank"] if str(amount).strip().lower() == "all" else int(amount)
     except (ValueError, TypeError):
         return await interaction.followup.send("❌ Amount must be a whole number or `all`.", ephemeral=True)
     if amt <= 0 or amt > GAMES_MAX_TRANSACTION:
         return await interaction.followup.send(f"❌ Amount must be between 1 and {GAMES_MAX_TRANSACTION:,}.", ephemeral=True)
-    ok, result = await async_db(games_bank_move(uid, amt, "withdraw"))
+    ok, result = await async_db(games_bank_move, uid, amt, "withdraw")
     if not ok:
         return await interaction.followup.send(f"❌ {result}", ephemeral=True)
     embed = discord.Embed(title=f"{games_emoji('bank', '🏦')} Withdrawal", description=f"{games_money(amt)} moved to cash", color=games_color("green"))
@@ -3012,7 +3025,7 @@ class ShopView(discord.ui.View):
             await interaction.edit_original_response(view=self)
         except Exception:
             pass
-        ok, res = await async_db(games_coin_spend(interaction.user.id, price, f"shop_{prepaid_kind}", meta={"item": item}))
+        ok, res = await async_db(games_coin_spend, interaction.user.id, price, f"shop_{prepaid_kind}", meta={"item": item})
         if not ok:
             self._busy = False
             self.refresh_buttons(interaction.user.id)
@@ -3038,7 +3051,7 @@ class ShopView(discord.ui.View):
                     raise
             new_count = await async_db(_db_step)
         except Exception as exc:
-            await async_db(games_coin_adjust(interaction.user.id, price, "shop_refund"))
+            await async_db(games_coin_adjust, interaction.user.id, price, "shop_refund")
             self._busy = False
             self.refresh_buttons(interaction.user.id)
             await self._refresh_ui(interaction, interaction.user.id)
@@ -3046,7 +3059,7 @@ class ShopView(discord.ui.View):
             return await interaction.followup.send("❌ Purchase failed — coins returned.", ephemeral=True)
         self._busy = False
         self.refresh_buttons(interaction.user.id)
-        bal = await async_db(games_coin_balance(interaction.user.id))
+        bal = await async_db(games_coin_balance, interaction.user.id)
         await self._refresh_ui(
             interaction, interaction.user.id,
             confirm=(
@@ -3259,7 +3272,7 @@ class CaseDropView(discord.ui.View):
                         if int(won.id) in COSMETIC_ROLE_IDS:
                             # Cosmetic: save to the /equip list, then apply the
                             # /equip rule (highest hierarchy gets worn).
-                            await async_db(set_user_cosmetic_role(member.id, int(won.id)))
+                            await async_db(set_user_cosmetic_role, member.id, int(won.id))
                             cosmetic_status = await games_auto_equip_cosmetic(member, won)
                             role_granted = True
                         else:
@@ -3287,8 +3300,8 @@ class CaseDropView(discord.ui.View):
             await async_db(_db_step)
         except Exception as exc:
             print(f"[games] drop roll audit failed: {exc}")
-        await async_db(games_track("case", interaction.channel_id, burned=0))
-        await async_db(games_track_user("case", interaction.user.id, win=role_granted))
+        await async_db(games_track, "case", interaction.channel_id, burned=0)
+        await async_db(games_track_user, "case", interaction.user.id, win=role_granted)
         if won is None:
             reveal = discord.Embed(
                 title=f"{self.emoji} {self.case_name} — Free Drop",
@@ -3440,7 +3453,7 @@ async def games_equip(interaction: discord.Interaction):
     member = interaction.user
     if not member or not isinstance(member, discord.Member):
         return await interaction.followup.send("❌ Must be used in server.", ephemeral=True)
-    db_owned_ids = await async_db(get_user_cosmetic_roles(member.id))
+    db_owned_ids = await async_db(get_user_cosmetic_roles, member.id)
     if not db_owned_ids:
         # fallback to Discord roles
         owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
@@ -3474,7 +3487,7 @@ async def games_equip(interaction: discord.Interaction):
             pass
     # Mark selected in DB (optional: could save best specifically; already saved)
     try:
-        await async_db(set_user_cosmetic_role(member.id, best.id if best else (owned[0].id if owned else 0)))
+        await async_db(set_user_cosmetic_role, member.id, best.id if best else (owned[0].id if owned else 0))
     except Exception:
         pass
     # Build embed with current owned list
@@ -3643,7 +3656,7 @@ class CaseConfirmView(discord.ui.View):
             except Exception:
                 pass
             return
-        ok, res = await async_db(games_coin_spend(interaction.user.id, self.price, "case_open", meta={"case": self.case_name}))
+        ok, res = await async_db(games_coin_spend, interaction.user.id, self.price, "case_open", meta={"case": self.case_name})
         if not ok:
             self.rolled = False
             return await interaction.followup.send(f"❌ {res}", ephemeral=True)
@@ -3665,8 +3678,8 @@ class CaseConfirmView(discord.ui.View):
                 await async_db(_db_step)
             except Exception:
                 pass
-            await async_db(games_track("case", interaction.channel_id, burned=self.price))
-            await async_db(games_track_user("case", interaction.user.id, win=False))
+            await async_db(games_track, "case", interaction.channel_id, burned=self.price)
+            await async_db(games_track_user, "case", interaction.user.id, win=False)
             reveal = discord.Embed(
                 title=f"{self.emoji} {self.case_name}",
                 description="The case rattles… and **nothing** falls out. 😔",
@@ -3685,12 +3698,12 @@ class CaseConfirmView(discord.ui.View):
             if isinstance(member, discord.Member) and won in member.roles:
                 # Duplicate protection keeps a paid roll from feeling completely dead.
                 duplicate_credit = max(1, self.price // 2)
-                await async_db(games_coin_adjust(member.id, duplicate_credit, "case_duplicate", meta={"case": self.case_name, "role": won.id}))
+                await async_db(games_coin_adjust, member.id, duplicate_credit, "case_duplicate", meta={"case": self.case_name, "role": won.id})
             elif isinstance(member, discord.Member):
                 if int(won.id) in COSMETIC_ROLE_IDS:
                     # Cosmetic: save to the /equip list, then apply the /equip
                     # rule (highest hierarchy gets worn).
-                    await async_db(set_user_cosmetic_role(member.id, int(won.id)))
+                    await async_db(set_user_cosmetic_role, member.id, int(won.id))
                     cosmetic_status = await games_auto_equip_cosmetic(member, won)
                     role_granted = True
                     # Send reminder message (if interaction available; else skip silent)
@@ -3723,13 +3736,13 @@ class CaseConfirmView(discord.ui.View):
             print(f"[games] case role grant failed: {exc}")
             if not duplicate_credit and not role_granted:
                 # A permission/API failure should not eat the player's roll.
-                await async_db(games_coin_adjust(interaction.user.id, self.price, "case_grant_refund", meta={"case": self.case_name}))
+                await async_db(games_coin_adjust, interaction.user.id, self.price, "case_grant_refund", meta={"case": self.case_name})
                 return await roll_msg.edit(content="❌ I couldn't grant that role — your coins were refunded.", embed=None)
             # If Discord granted the role but only the audit insert failed, never
             # refund as well: that would turn a transient DB error into a free role.
             print(f"[games] case reward granted but roll audit failed: case={self.case_id} user={interaction.user.id}")
-        await async_db(games_track("case", interaction.channel_id, burned=max(0, self.price - duplicate_credit)))
-        await async_db(games_track_user("case", interaction.user.id, win=role_granted))
+        await async_db(games_track, "case", interaction.channel_id, burned=max(0, self.price - duplicate_credit))
+        await async_db(games_track_user, "case", interaction.user.id, win=role_granted)
         chance = float(self.weights[self.roles.index(won)])
         is_rare = chance <= 5
         reveal = discord.Embed(
@@ -3819,15 +3832,15 @@ async def games_case_open(interaction: discord.Interaction, name: str):
             weights.append(filler_weight)
             lines.append(f"\u2b1c Nothing \u2014 **{filler_weight:g}%** `{games_bar(filler_weight, 100, 8)}`")
 
-        bal = await async_db(games_coin_balance(interaction.user.id))
-        _dbv1_3093 = await async_db(games_is_unlimited(interaction.user.id))
+        bal = await async_db(games_coin_balance, interaction.user.id)
+        _dbv1_3093 = await async_db(games_is_unlimited, interaction.user.id)
         can_afford = _dbv1_3093 or bal["balance"] >= int(price)
         embed = discord.Embed(
             title=f"{emoji} {cname}",
             description="\n".join(lines) or "No contents.",
             color=games_color("violet"),
         )
-        _dbv1_3099 = await async_db(games_is_unlimited(interaction.user.id))
+        _dbv1_3099 = await async_db(games_is_unlimited, interaction.user.id)
         embed.add_field(name="Price", value=f"**{int(price):,}** 🪙" + (" \u00b7 \u221e unlimited" if _dbv1_3099 else ""), inline=True)
         embed.add_field(name="Your cash", value=f"**{bal['balance']:,}**" + ("" if can_afford else " \u2014 not enough!"), inline=True)
         if getattr(guild, "icon", None):
@@ -3921,15 +3934,15 @@ async def coins_admin(interaction: discord.Interaction, action: str, user: disco
         return await interaction.followup.send(
             f"❌ Amount must be between 0 and {GAMES_MAX_TRANSACTION:,}.", ephemeral=True)
     if action == "add":
-        ok, res = await async_db(games_coin_adjust(user.id, int(amount), "admin_add", actor_id=interaction.user.id))
+        ok, res = await async_db(games_coin_adjust, user.id, int(amount), "admin_add", actor_id=interaction.user.id)
         return await interaction.followup.send(f"✅ +{amount:,} to {user.mention}." if ok else f"❌ {res}", ephemeral=True)
     if action == "remove":
-        ok, res = await async_db(games_coin_adjust(user.id, -int(amount), "admin_remove", actor_id=interaction.user.id))
+        ok, res = await async_db(games_coin_adjust, user.id, -int(amount), "admin_remove", actor_id=interaction.user.id)
         return await interaction.followup.send(f"✅ −{amount:,} from {user.mention}." if ok else f"❌ {res}", ephemeral=True)
     if action == "set":
-        bal = await async_db(games_coin_balance(user.id))
+        bal = await async_db(games_coin_balance, user.id)
         delta = int(amount) - bal["balance"]
-        ok, res = await async_db(games_coin_adjust(user.id, delta, "admin_set", actor_id=interaction.user.id))
+        ok, res = await async_db(games_coin_adjust, user.id, delta, "admin_set", actor_id=interaction.user.id)
         return await interaction.followup.send(f"✅ {user.mention} balance set to {amount:,}." if ok else f"❌ {res}", ephemeral=True)
     return await interaction.followup.send("Unknown action.", ephemeral=True)
 
@@ -4303,7 +4316,7 @@ async def games_guess_timeout(channel_id, started):
     await async_db(games_session_end, f"guess:{channel_id}")
     if round_info.get("rewarded", True):
         await async_db(games_guess_record_result, round_info)
-        await async_db(games_track_participants("guess", round_info.get("participants"), winner_id=None))
+        await async_db(games_track_participants, "guess", round_info.get("participants"), winner_id=None)
     channel = bot.get_channel(channel_id)
     if channel is None:
         return
@@ -4447,7 +4460,7 @@ async def games_start_guess_round(channel, pet_key=None, mode=None, rewarded=Tru
             "rewarded": round_info["rewarded"], "participants": [],
             "message_id": round_info["message_id"],
         })
-        await async_db(games_track("guess", channel_id, sessions=1))
+        await async_db(games_track, "guess", channel_id, sessions=1)
         clock = asyncio.create_task(games_guess_clock(channel_id, started))
         ACTIVE_GUESS_TASKS[channel_id] = clock
         return round_info
@@ -4496,7 +4509,7 @@ async def games_maybe_spawn(message):
     if now - float(_spawn_last_global.get("ts", 0)) < GAMES_SPAWN_GLOBAL_COOLDOWN:
         return
     try:
-        _dbv1_3740 = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANCE, str(GAMES_DEFAULT_CHANCE_PCT)))
+        _dbv1_3740 = await async_db(db_get_setting, GAMES_SETTING_SPAWN_CHANCE, str(GAMES_DEFAULT_CHANCE_PCT))
         chance = float(_dbv1_3740 or GAMES_DEFAULT_CHANCE_PCT)
     except Exception:
         chance = GAMES_DEFAULT_CHANCE_PCT
@@ -4565,19 +4578,19 @@ async def games_handle_answer(message):
     previous = await async_db(games_guess_profile, message.author.id)
     reward = games_guess_reward(round_info, elapsed, previous.get("current_streak", 0))
     if reward > 0:
-        paid, error = await async_db(games_coin_adjust(
+        paid, error = await async_db(games_coin_adjust,
             message.author.id, reward, "guess_win",
             meta={"pet": round_info["pet_name"], "mode": round_info["mode"],
                   "seconds": round(elapsed, 3), "hints": round_info.get("hint_step", 0)},
-        ))
+        )
         if not paid:
             print(f"[games] guess reward failed for {message.author.id}: {error}")
             reward = 0
     if rewarded_round:
         elapsed_ms = int(round(elapsed * 1000))
         await async_db(games_guess_record_result, round_info, message.author.id, reward, elapsed_ms)
-        await async_db(games_track("guess", message.channel.id, sessions=0, minted=reward))
-        await async_db(games_track_participants("guess", round_info.get("participants"), winner_id=message.author.id))
+        await async_db(games_track, "guess", message.channel.id, sessions=0, minted=reward)
+        await async_db(games_track_participants, "guess", round_info.get("participants"), winner_id=message.author.id)
         profile = await async_db(games_guess_profile, message.author.id)
     else:
         # Staff practice cannot farm coins, leaderboard wins, streaks or role progress.
@@ -4812,7 +4825,7 @@ async def games_pets(interaction: discord.Interaction, user: discord.User = None
                 else games_emoji("huge", "💥") if name.startswith("Huge") else games_emoji("pets", "🐾")
             lines.append(f"{emoji} **{name}** ×{count}")
         # collection completion vs the real pet database
-        _dbv1_4033 = await async_db(games_get_pets())
+        _dbv1_4033 = await async_db(games_get_pets)
         total_in_db = len(_dbv1_4033)
         pct = (total_unique / total_in_db * 100) if total_in_db else 0
         embed = discord.Embed(
@@ -5285,10 +5298,10 @@ async def settle_duel(duel_id, winner_id, reason):
         winner_id = int(winner_id)
         pot = int(result)
         # The pot was escrowed from both players: this is circulation, not minting.
-        await async_db(games_track("duel", duel.get("channel_id", 0)))
-        await async_db(games_track_user("duel", winner_id, win=True))
+        await async_db(games_track, "duel", duel.get("channel_id", 0))
+        await async_db(games_track_user, "duel", winner_id, win=True)
         loser_id = duel["target"] if winner_id == int(duel["challenger"]) else duel["challenger"]
-        await async_db(games_track_user("duel", loser_id, win=False))
+        await async_db(games_track_user, "duel", loser_id, win=False)
         try:
             guild = bot.get_guild(GUILD_ID)
             if guild:
@@ -5399,7 +5412,7 @@ async def games_scramble(interaction: discord.Interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.channel.id in ACTIVE_SCRAMBLE:
         return await interaction.followup.send("❌ A scramble is already active in this channel.", ephemeral=True)
-    _dbv1_4589 = await async_db(games_is_unlimited(interaction.user.id))
+    _dbv1_4589 = await async_db(games_is_unlimited, interaction.user.id)
     if _dbv1_4589:
         allowed, retry_at = (True, None)
     else:
@@ -5454,9 +5467,9 @@ async def games_handle_scramble(message):
     if games_answers_match(message.content, s["answer"]):
         ACTIVE_SCRAMBLE.pop(message.channel.id, None)
         await async_db(games_session_end, f"scramble:{message.channel.id}")
-        await async_db(games_coin_adjust(message.author.id, 100, "scramble_win", meta={"word": s["answer"]}))
-        await async_db(games_track("scramble", message.channel.id, minted=100))
-        await async_db(games_track_participants("scramble", s.get("participants"), winner_id=message.author.id))
+        await async_db(games_coin_adjust, message.author.id, 100, "scramble_win", meta={"word": s["answer"]})
+        await async_db(games_track, "scramble", message.channel.id, minted=100)
+        await async_db(games_track_participants, "scramble", s.get("participants"), winner_id=message.author.id)
         embed = discord.Embed(
             title="🎉 Scramble Solved!",
             description=f"**{getattr(message.author, 'mention', '')}** unscrambled it — **{s['answer']}**!",
@@ -5478,7 +5491,7 @@ async def games_hangman(interaction: discord.Interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.channel.id in ACTIVE_HANGMAN:
         return await interaction.followup.send("❌ A hangman game is already active here.", ephemeral=True)
-    _dbv1_4659 = await async_db(games_is_unlimited(interaction.user.id))
+    _dbv1_4659 = await async_db(games_is_unlimited, interaction.user.id)
     if _dbv1_4659:
         allowed, retry_at = (True, None)
     else:
@@ -5560,7 +5573,7 @@ async def games_handle_hangman(message):
     async def finish(winner=None):
         ACTIVE_HANGMAN.pop(message.channel.id, None)
         await async_db(games_session_end, f"hangman:{message.channel.id}")
-        await async_db(games_track_participants("hangman", g.get("participants"), winner_id=getattr(winner, "id", None)))
+        await async_db(games_track_participants, "hangman", g.get("participants"), winner_id=getattr(winner, "id", None))
         if winner is None:
             e = discord.Embed(
                 title="💀 Hangman Lost!",
@@ -5569,8 +5582,8 @@ async def games_handle_hangman(message):
             )
             e.set_footer(text="Run /hangman to try again")
         else:
-            await async_db(games_coin_adjust(winner.id, 150, "hangman_win", meta={"word": g["word"]}))
-            await async_db(games_track("hangman", message.channel.id, minted=150))
+            await async_db(games_coin_adjust, winner.id, 150, "hangman_win", meta={"word": g["word"]})
+            await async_db(games_track, "hangman", message.channel.id, minted=150)
             e = discord.Embed(
                 title="🎉 Hangman Solved!",
                 description=f"**{getattr(winner, 'mention', '')}** solved it — **{g['word']}**!",
@@ -5801,11 +5814,11 @@ async def games_petdle(interaction: discord.Interaction, guess: str = None):
         embed.add_field(name="Answer", value=f"**{target}**", inline=True)
         embed.add_field(name="Reward", value="+`200` 🪙" if result["awarded"] else "Already claimed ✅", inline=True)
         if result["awarded"]:
-            await async_db(games_track("petdle", interaction.channel_id, minted=200))
-            await async_db(games_track_user("petdle", interaction.user.id, win=True))
+            await async_db(games_track, "petdle", interaction.channel_id, minted=200)
+            await async_db(games_track_user, "petdle", interaction.user.id, win=True)
     elif lost:
         embed.add_field(name="Answer", value=f"**{target}**", inline=True)
-        await async_db(games_track_user("petdle", interaction.user.id, win=False))
+        await async_db(games_track_user, "petdle", interaction.user.id, win=False)
     elif len(guesses) >= 3:
         embed.add_field(name="💡 Hint", value=f"Starts with **{target_core[0].upper()}**", inline=True)
     games_footer(embed, "New puzzle at 00:00 UTC")
@@ -6076,17 +6089,17 @@ async def games_spin(interaction: discord.Interaction):
     await interaction.response.defer()
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
-    free, spins = await async_db(games_free_use(interaction.user.id, "spin"))
+    free, spins = await async_db(games_free_use, interaction.user.id, "spin")
     if not free:
-        _dbv1_5240 = await async_db(games_prepaid_consume(interaction.user.id, "spin"))
+        _dbv1_5240 = await async_db(games_prepaid_consume, interaction.user.id, "spin")
         if not _dbv1_5240:
-            ok, res = await async_db(games_coin_spend(interaction.user.id, GAMES_SPIN_COST_EXTRA, "spin_extra"))
+            ok, res = await async_db(games_coin_spend, interaction.user.id, GAMES_SPIN_COST_EXTRA, "spin_extra")
             if not ok:
                 return await interaction.followup.send(f"❌ {res}", ephemeral=True)
 
     # ALWAYS log usage so the free spin can't be farmed on zero-prize outcomes
-    await async_db(games_coin_log_zero(interaction.user.id, "spin", meta={"free": free}))
-    _dbv1_5247 = await async_db(games_is_unlimited(interaction.user.id))
+    await async_db(games_coin_log_zero, interaction.user.id, "spin", meta={"free": free})
+    _dbv1_5247 = await async_db(games_is_unlimited, interaction.user.id)
     spin_burned = 0 if free or _dbv1_5247 else GAMES_SPIN_COST_EXTRA
 
     idx, label, rolled_amount, is_jackpot = games_spin_roll()
@@ -6100,27 +6113,27 @@ async def games_spin(interaction: discord.Interaction):
 
     embed = discord.Embed(title=f"{games_emoji('spin', '🎡')} Spin the Wheel", color=games_color("purple"))
     if is_jackpot:
-        await async_db(games_track("spin", interaction.channel.id, minted=amount, burned=spin_burned))
-        await async_db(games_track_user("spin", interaction.user.id, win=True))
+        await async_db(games_track, "spin", interaction.channel.id, minted=amount, burned=spin_burned)
+        await async_db(games_track_user, "spin", interaction.user.id, win=True)
         embed.color = games_color("gold")
         embed.title = f"{games_emoji('jackpot', '🎰')} JACKPOT!"
         embed.description = f"{interaction.user.mention} wins the whole **{amount:,}** coin jackpot! 🎆"
         embed.add_field(name="You won", value=games_money(amount), inline=True)
     elif amount > 0:
-        await async_db(games_track("spin", interaction.channel.id, minted=amount, burned=spin_burned))
-        await async_db(games_track_user("spin", interaction.user.id, win=True))
+        await async_db(games_track, "spin", interaction.channel.id, minted=amount, burned=spin_burned)
+        await async_db(games_track_user, "spin", interaction.user.id, win=True)
         embed.color = games_color("green")
         embed.description = f"\u2728 You landed on **{label}**!"
         embed.add_field(name="You won", value=games_money(amount), inline=True)
     elif item == "scratch":
-        await async_db(games_track("spin", interaction.channel.id, burned=spin_burned))
-        await async_db(games_track_user("spin", interaction.user.id, win=True))
+        await async_db(games_track, "spin", interaction.channel.id, burned=spin_burned)
+        await async_db(games_track_user, "spin", interaction.user.id, win=True)
         embed.color = games_color("cyan")
         embed.description = "🎴 You won a **free scratch card**!"
         embed.add_field(name="You won", value="**Extra Scratch ×1**", inline=True)
     else:
-        await async_db(games_track("spin", interaction.channel.id, burned=spin_burned))
-        await async_db(games_track_user("spin", interaction.user.id, win=False))
+        await async_db(games_track, "spin", interaction.channel.id, burned=spin_burned)
+        await async_db(games_track_user, "spin", interaction.user.id, win=False)
         embed.color = games_color("slate")
         embed.description = f"You landed on **{label}** \u2014 better luck next time!"
         embed.add_field(name="You won", value="nothing 😔", inline=True)
@@ -6196,15 +6209,15 @@ async def games_scratch(interaction: discord.Interaction):
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     # 1 free daily (atomic 24h window)
-    free, used = await async_db(games_free_use(interaction.user.id, "scratch"))
+    free, used = await async_db(games_free_use, interaction.user.id, "scratch")
     if not free:
-        _dbv1_5360 = await async_db(games_prepaid_consume(interaction.user.id, "scratch"))
+        _dbv1_5360 = await async_db(games_prepaid_consume, interaction.user.id, "scratch")
         if not _dbv1_5360:
-            ok, res = await async_db(games_coin_spend(interaction.user.id, 100, "scratch_extra"))
+            ok, res = await async_db(games_coin_spend, interaction.user.id, 100, "scratch_extra")
             if not ok:
                 return await interaction.followup.send(f"❌ {res}", ephemeral=True)
-    await async_db(games_coin_log_zero(interaction.user.id, "scratch", meta={"free": free}))
-    _dbv1_5365 = await async_db(games_is_unlimited(interaction.user.id))
+    await async_db(games_coin_log_zero, interaction.user.id, "scratch", meta={"free": free})
+    _dbv1_5365 = await async_db(games_is_unlimited, interaction.user.id)
     scratch_burned = 0 if free or _dbv1_5365 else 100
     pool = [p for p in GAMES_PET_SEED]
     tier_weights = []
@@ -6232,11 +6245,11 @@ async def games_scratch(interaction: discord.Interaction):
     elif best == 2:
         award = 100
     if award:
-        await async_db(games_coin_adjust(interaction.user.id, award, "scratch_win", meta={"picks": picks, "pity": pity_triggered}))
-        await async_db(games_track("scratch", interaction.channel_id, minted=award, burned=scratch_burned))
+        await async_db(games_coin_adjust, interaction.user.id, award, "scratch_win", meta={"picks": picks, "pity": pity_triggered})
+        await async_db(games_track, "scratch", interaction.channel_id, minted=award, burned=scratch_burned)
     else:
-        await async_db(games_track("scratch", interaction.channel_id, burned=scratch_burned))
-    await async_db(games_track_user("scratch", interaction.user.id, win=award > 0))
+        await async_db(games_track, "scratch", interaction.channel_id, burned=scratch_burned)
+    await async_db(games_track_user, "scratch", interaction.user.id, win=award > 0)
     if best == 3:
         result_txt = f"{games_emoji('win', '🎆')} **TRIPLE MATCH! +{award:,}** 🪙"
         result_color = games_color("gold")
@@ -6640,7 +6653,7 @@ async def games_bingo_mark_all():
     if announcements:
         tier_emoji = {"line": "🎯", "bingo": "🎉", "blackout": "🌑"}
         try:
-            _dbv1_5780 = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
+            _dbv1_5780 = await async_db(db_get_setting, GAMES_SETTING_SPAWN_CHANNELS, "[]")
             chans = json.loads(_dbv1_5780 or "[]")
         except Exception:
             chans = []
@@ -6754,7 +6767,7 @@ async def games_housekeeping_loop():
             if elapsed > GAMES_ROUND_TIMEOUT:
                 ACTIVE_SCRAMBLE.pop(ch, None)
                 await async_db(games_session_end, f"scramble:{ch}")
-                await async_db(games_track_participants("scramble", s.get("participants"), winner_id=None))
+                await async_db(games_track_participants, "scramble", s.get("participants"), winner_id=None)
                 try:
                     channel = bot.get_channel(int(ch))
                     if channel:
@@ -6779,7 +6792,7 @@ async def games_housekeeping_loop():
             if now - float(g["started"]) > 300:
                 ACTIVE_HANGMAN.pop(ch, None)
                 await async_db(games_session_end, f"hangman:{ch}")
-                await async_db(games_track_participants("hangman", g.get("participants"), winner_id=None))
+                await async_db(games_track_participants, "hangman", g.get("participants"), winner_id=None)
                 e = discord.Embed(title="⏰ Hangman Expired", description=f"It was **{g.get('word', '?')}**.", color=games_color("slate"))
                 await _hangman_update(g, e)
         # Fallback settlement if an in-memory timeout task was cancelled or lost.
@@ -6840,9 +6853,9 @@ async def games_housekeeping_loop():
                 await games_tower_timeout(uid, s)
         # 2. Daily interest tick (1%/day, capped, integer math) — in a thread so
         #    it can never stall commands.
-        _dbv1_5955 = await async_db(db_get_setting(GAMES_SETTING_INTEREST_RATE, str(GAMES_INTEREST_RATE_PCT_DEFAULT)))
+        _dbv1_5955 = await async_db(db_get_setting, GAMES_SETTING_INTEREST_RATE, str(GAMES_INTEREST_RATE_PCT_DEFAULT))
         rate = float(_dbv1_5955 or 0)
-        _dbv1_5956 = await async_db(db_get_setting(GAMES_SETTING_INTEREST_CAP, str(GAMES_INTEREST_CAP_DEFAULT)))
+        _dbv1_5956 = await async_db(db_get_setting, GAMES_SETTING_INTEREST_CAP, str(GAMES_INTEREST_CAP_DEFAULT))
         cap = int(_dbv1_5956 or 0)
 
         def _interest_tick():
@@ -6907,7 +6920,7 @@ async def games_housekeeping_loop():
         except Exception as exc:
             print(f"[games] monthly petmaster check failed: {exc}")
         # 4. Real pet/egg sync (daily, threaded, batched — a few seconds)
-        _dbv1_6020 = await async_db(db_get_setting("games_eggs_synced_at", "0"))
+        _dbv1_6020 = await async_db(db_get_setting, "games_eggs_synced_at", "0")
         last_sync = int(_dbv1_6020 or 0)
         if time.time() - last_sync > 24 * 3600:
             # Pets first so every game sees current name→asset mappings before
@@ -6923,10 +6936,10 @@ async def games_housekeeping_loop():
         # 5. Lottery auto-draw (Sunday 20:00 UTC window, threaded)
         now_dt = datetime.now(timezone.utc)
         if now_dt.weekday() == 6 and now_dt.hour >= 20:
-            last_draw = await async_db(db_get_setting("games_lottery_last_draw_week", ""))
+            last_draw = await async_db(db_get_setting, "games_lottery_last_draw_week", "")
             draw_key = now_dt.strftime("%Y-%m-%d")
             if last_draw != draw_key:
-                raw = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
+                raw = await async_db(db_get_setting, GAMES_SETTING_SPAWN_CHANNELS, "[]")
                 try:
                     chans = json.loads(raw or "[]")
                 except Exception:
@@ -6934,7 +6947,7 @@ async def games_housekeeping_loop():
                 ch = bot.get_channel(int(chans[0])) if chans else None
                 # Draw even without an announcement channel; never mark it done first.
                 await games_lottery_draw(ch)
-                await async_db(db_set_setting("games_lottery_last_draw_week", draw_key))
+                await async_db(db_set_setting, "games_lottery_last_draw_week", draw_key)
         # Autocomplete callbacks consume only this worker-refreshed snapshot.
         await games_refresh_interaction_caches()
     except Exception as exc:
@@ -7879,9 +7892,9 @@ async def games_trivia_next(ctx, session):
         game_key = session.get("game", "trivia")
         award = score * GAMES_TRIVIA_CORRECT_REWARD + (GAMES_TRIVIA_PERFECT_BONUS if score == total else 0)
         if award:
-            await async_db(games_coin_adjust(session["user_id"], award, f"{game_key}_win", meta={"score": score, "total": total}))
-            await async_db(games_track(game_key, getattr(ctx.channel, "id", 0), minted=award))
-        await async_db(games_track_user(game_key, session["user_id"], win=score >= max(1, (total + 1) // 2)))
+            await async_db(games_coin_adjust, session["user_id"], award, f"{game_key}_win", meta={"score": score, "total": total})
+            await async_db(games_track, game_key, getattr(ctx.channel, "id", 0), minted=award)
+        await async_db(games_track_user, game_key, session["user_id"], win=score >= max(1, (total + 1) // 2))
         ACTIVE_TRIVIA.pop(session["user_id"], None)
         rank, rank_color, stars = ("S", "gold", "⭐⭐⭐") if score == total else (
             ("A", "green", "⭐⭐") if score >= total - 1 else
@@ -7923,7 +7936,7 @@ async def games_trivia(interaction: discord.Interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.user.id in ACTIVE_TRIVIA:
         return await interaction.followup.send("❌ You already have a trivia session running — finish it first!", ephemeral=True)
-    _dbv1_6955 = await async_db(games_is_unlimited(interaction.user.id))
+    _dbv1_6955 = await async_db(games_is_unlimited, interaction.user.id)
     if _dbv1_6955:
         allowed, retry_at = (True, None)
     else:
@@ -8332,11 +8345,11 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
     await interaction.response.defer()
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
-    eggs = await async_db(games_get_eggs())
+    eggs = await async_db(games_get_eggs)
     if not eggs:
         return await interaction.followup.send("❌ No eggs available right now.", ephemeral=True)
 
-    featured_slug = await async_db(games_featured_egg())
+    featured_slug = await async_db(games_featured_egg)
     egg_def = None
     if egg:
         egg_def = next((e for e in eggs if e["name"].lower() == egg.lower()), None)
@@ -8352,11 +8365,11 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
             ephemeral=True,
         )
 
-    free, used = await async_db(games_free_use(interaction.user.id, "hatch"))
+    free, used = await async_db(games_free_use, interaction.user.id, "hatch")
     if not free:
-        _dbv1_7383 = await async_db(games_prepaid_consume(interaction.user.id, "hatch"))
+        _dbv1_7383 = await async_db(games_prepaid_consume, interaction.user.id, "hatch")
         if not _dbv1_7383:
-            ok, res = await async_db(games_coin_spend(interaction.user.id, GAMES_HATCH_COST, "hatch_extra", meta={"egg": egg_name}))
+            ok, res = await async_db(games_coin_spend, interaction.user.id, GAMES_HATCH_COST, "hatch_extra", meta={"egg": egg_name})
             if not ok:
                 return await interaction.followup.send(f"❌ {res}", ephemeral=True)
 
@@ -8364,7 +8377,7 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
         pet_name, tier, real_chance = games_hatch_roll_featured(egg_def)
     else:
         pet_name, tier, real_chance = games_hatch_roll(egg_def)
-    await async_db(games_coin_log_zero(interaction.user.id, "hatch", meta={"egg": egg_name, "free": free, "featured": is_featured}))
+    await async_db(games_coin_log_zero, interaction.user.id, "hatch", meta={"egg": egg_name, "free": free, "featured": is_featured})
 
     try:
         def _db_step():
@@ -8389,11 +8402,11 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
     asset_id = await async_db(games_pet_asset, pet_name)
     icon = await games_fetch_pet_icon(asset_id) if asset_id else None
     _dbv1_9002 = await async_db(games_is_unlimited, interaction.user.id)
-    await async_db(games_track(
+    await async_db(games_track,
         "hatch", interaction.channel_id,
         burned=0 if free or _dbv1_9002 else GAMES_HATCH_COST,
-    ))
-    await async_db(games_track_user("hatch", interaction.user.id, win=tier in ("titanic", "huge", "gargantuan")))
+    )
+    await async_db(games_track_user, "hatch", interaction.user.id, win=tier in ("titanic", "huge", "gargantuan"))
 
     tier_emoji, tier_label, tier_rgb = games_tier_style(tier)
     odds_txt = f"{real_chance:g}%" if real_chance is not None else "—"
@@ -8488,11 +8501,11 @@ async def games_eggs(interaction: discord.Interaction, egg: str = None):
     await interaction.response.defer(ephemeral=True)
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
-    eggs = await async_db(games_get_eggs())
+    eggs = await async_db(games_get_eggs)
     if not eggs:
         return await interaction.followup.send("No eggs synced yet — try `/gamesadmin sync` (owner).", ephemeral=True)
 
-    featured_slug = await async_db(games_featured_egg())
+    featured_slug = await async_db(games_featured_egg)
     if egg:
         target = next((e for e in eggs if e["name"].lower() == egg.lower()), None)
         if not target:
@@ -8943,15 +8956,15 @@ async def games_check_tower_master(guild, user_id):
 # ---------- PET MASTER: monthly top guesser (housekeeping job) ----------
 async def games_monthly_petmaster(guild):
     try:
-        last = await async_db(db_get_setting("games_petmaster_month", ""))
+        last = await async_db(db_get_setting, "games_petmaster_month", "")
         month = datetime.now(timezone.utc).strftime("%Y-%m")
         if not last:
             # Establish a baseline; don't crown/reset mid-month on first deploy.
-            await async_db(db_set_setting("games_petmaster_month", month))
+            await async_db(db_set_setting, "games_petmaster_month", month)
             return
         if last == month:
             return
-        prev_holder = await async_db(db_get_setting("games_petmaster_holder", "0"))
+        prev_holder = await async_db(db_get_setting, "games_petmaster_holder", "0")
         def _db_step():
             try:
                 with conn.cursor() as cur:
@@ -8974,7 +8987,7 @@ async def games_monthly_petmaster(guild):
                 raise
         row = await async_db(_db_step)
         if not row or int(row[1] or 0) <= 0:
-            await async_db(db_set_setting("games_petmaster_month", month))
+            await async_db(db_set_setting, "games_petmaster_month", month)
             return
         new_holder = int(row[0])
         # remove from previous holder, grant to new
@@ -8989,10 +9002,10 @@ async def games_monthly_petmaster(guild):
         except Exception as exc:
             print(f"[games] petmaster prev removal failed: {exc}")
         await games_grant_role(guild, new_holder, "petmaster")
-        await async_db(db_set_setting("games_petmaster_holder", str(new_holder)))
-        await async_db(db_set_setting("games_petmaster_month", month))
+        await async_db(db_set_setting, "games_petmaster_holder", str(new_holder))
+        await async_db(db_set_setting, "games_petmaster_month", month)
         try:
-            _dbv1_7980 = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
+            _dbv1_7980 = await async_db(db_get_setting, GAMES_SETTING_SPAWN_CHANNELS, "[]")
             chans = json.loads(_dbv1_7980 or "[]")
             channel = bot.get_channel(int(chans[0])) if chans else None
             if channel:
@@ -9197,8 +9210,8 @@ async def games_tower_finish(channel, user, session, reached_roof=False):
         best = await async_db(_db_step)
     except Exception as exc:
         print(f"[games] tower score save failed: {exc}")
-    await async_db(games_track("tower", getattr(channel, "id", 0), minted=session["score"]))
-    await async_db(games_track_user("tower", user.id, win=reached_roof or reached >= 5))
+    await async_db(games_track, "tower", getattr(channel, "id", 0), minted=session["score"])
+    await async_db(games_track_user, "tower", user.id, win=reached_roof or reached >= 5)
     try:
         guild = bot.get_guild(GUILD_ID)
         if guild:
@@ -9233,7 +9246,7 @@ async def games_tower_result_from_chat(channel, user, correct):
         award = cleared_floor * 25 + combo_bonus
         session["floor"] += 1
         session["score"] += award
-        await async_db(games_coin_adjust(user.id, award, "tower_floor", meta={"floor": cleared_floor, "combo": session["combo"]}))
+        await async_db(games_coin_adjust, user.id, award, "tower_floor", meta={"floor": cleared_floor, "combo": session["combo"]})
         embed = discord.Embed(
             title=f"✅ Floor {cleared_floor} Clear!",
             description=(f"<@{user.id}> reached the roof!" if cleared_floor >= GAMES_TOWER_MAX_FLOOR
@@ -9679,11 +9692,11 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             }
             lines = [f"{game_emoji.get(str(g), '🎮')} **{g}** — `{s}` sessions · +{m:,} minted · −{b:,} burned" for g, s, m, b, _ in rows] or ["Nothing played yet!"]
             embed.description = "\n".join(lines)
-            _dbv1_8626 = await async_db(games_jackpot_get())
+            _dbv1_8626 = await async_db(games_jackpot_get)
             embed.add_field(name="🎰 Spin jackpot", value=f"**{_dbv1_8626:,}** 🪙", inline=True)
-            _dbv1_8627 = await async_db(games_get_eggs())
+            _dbv1_8627 = await async_db(games_get_eggs)
             embed.add_field(name="🥚 Eggs synced", value=str(len(_dbv1_8627)), inline=True)
-            _dbv1_8628 = await async_db(games_get_pets())
+            _dbv1_8628 = await async_db(games_get_pets)
             embed.add_field(name="🐾 Pets synced", value=str(len(_dbv1_8628)), inline=True)
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as exc:
@@ -9694,7 +9707,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         new_state = str(value or "").strip().lower()
         if new_state not in ("on", "off"):
             return await interaction.followup.send("Usage: value = `on` or `off`.", ephemeral=True)
-        await async_db(db_set_setting(GAMES_SETTING_ENABLED, "1" if new_state == "on" else "0"))
+        await async_db(db_set_setting, GAMES_SETTING_ENABLED, "1" if new_state == "on" else "0")
         return await interaction.followup.send(f"✅ Games are now **{'PUBLIC' if new_state == 'on' else 'TESTING-ONLY'}**.", ephemeral=True)
 
     if action == "tester_add":
@@ -9769,7 +9782,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         except Exception:
             return await interaction.followup.send("Usage: value = percent (e.g. 1 = 1% per message).", ephemeral=True)
         safe_pct = max(0.0, min(100.0, pct))
-        await async_db(db_set_setting(GAMES_SETTING_SPAWN_CHANCE, str(safe_pct)))
+        await async_db(db_set_setting, GAMES_SETTING_SPAWN_CHANCE, str(safe_pct))
         return await interaction.followup.send(f"✅ Spawn chance set to **{safe_pct:g}%** per message.", ephemeral=True)
 
     if action in ("spawn_add", "spawn_remove"):
@@ -9784,7 +9797,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
                 "❌ I can't find that channel — mention it directly (e.g. `#games`).", ephemeral=True)
         if getattr(chan, "type", None) not in (discord.ChannelType.text, discord.ChannelType.news):
             return await interaction.followup.send("❌ Spawns only work in text channels.", ephemeral=True)
-        raw = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
+        raw = await async_db(db_get_setting, GAMES_SETTING_SPAWN_CHANNELS, "[]")
         try:
             chans = json.loads(raw or "[]")
         except Exception:
@@ -9793,14 +9806,14 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             chans.append(cid)
         elif action == "spawn_remove" and cid in chans:
             chans.remove(cid)
-        await async_db(db_set_setting(GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans)))
+        await async_db(db_set_setting, GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans))
         names = " ".join(f"<#{c}>" for c in chans) or "none"
         return await interaction.followup.send(
             f"✅ {'Added' if action == 'spawn_add' else 'Removed'} <#{cid}>\n"
             f"Active spawn channels: {names}", ephemeral=True)
 
     if action == "spawn_list":
-        raw = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
+        raw = await async_db(db_get_setting, GAMES_SETTING_SPAWN_CHANNELS, "[]")
         try:
             chans = json.loads(raw or "[]")
         except Exception:
@@ -9822,11 +9835,11 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             ok_pets = await asyncio.to_thread(games_sync_pets_from_web)
             ok_eggs = await asyncio.to_thread(games_sync_eggs_v2)
             await games_refresh_interaction_caches()
-            _dbv1_8738 = await async_db(games_get_pets())
+            _dbv1_8738 = await async_db(games_get_pets)
             pets = len(_dbv1_8738)
-            _dbv1_8739 = await async_db(games_get_pets(require_asset=True))
+            _dbv1_8739 = await async_db(games_get_pets, require_asset=True)
             pets_with_icons = len(_dbv1_8739)
-            _dbv1_8740 = await async_db(games_get_eggs())
+            _dbv1_8740 = await async_db(games_get_eggs)
             eggs = len(_dbv1_8740)
             await interaction.followup.send(
                 f"✅ Sync done — **{pets}** pets, **{pets_with_icons}** with unique icon assets, "
@@ -9845,9 +9858,9 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             return await interaction.followup.send("Usage: value = `rate% [cap]` e.g. `1 100000`.", ephemeral=True)
         safe_rate = max(0.0, min(100.0, rate))
         safe_cap = max(0, cap) if cap is not None else None
-        await async_db(db_set_setting(GAMES_SETTING_INTEREST_RATE, str(safe_rate)))
+        await async_db(db_set_setting, GAMES_SETTING_INTEREST_RATE, str(safe_rate))
         if safe_cap is not None:
-            await async_db(db_set_setting(GAMES_SETTING_INTEREST_CAP, str(safe_cap)))
+            await async_db(db_set_setting, GAMES_SETTING_INTEREST_CAP, str(safe_cap))
         return await interaction.followup.send(
             f"✅ Interest: **{safe_rate:g}%/day** on up to **{safe_cap if safe_cap is not None else 'the current cap'}** banked.",
             ephemeral=True,
@@ -9861,7 +9874,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         if seed < 100:
             return await interaction.followup.send("❌ Seed must be at least 100.", ephemeral=True)
         games_jackpot_set(seed)
-        await async_db(db_set_setting(GAMES_SETTING_JACKPOT_SEED, str(seed)))
+        await async_db(db_set_setting, GAMES_SETTING_JACKPOT_SEED, str(seed))
         return await interaction.followup.send(f"✅ Jackpot reset to **{seed:,}**.", ephemeral=True)
 
     if action == "role":
@@ -9874,21 +9887,21 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             return await interaction.followup.send("Usage: value = `duelist|petmaster|towermaster @role`.", ephemeral=True)
         if kind not in ("duelist", "petmaster", "towermaster"):
             return await interaction.followup.send("❌ Kind must be duelist, petmaster or towermaster.", ephemeral=True)
-        await async_db(db_set_setting(f"games_role_{kind}", str(rid)))
+        await async_db(db_set_setting, f"games_role_{kind}", str(rid))
         return await interaction.followup.send(f"✅ **{kind}** role set to <@&{rid}>.", ephemeral=True)
 
     if action == "setup":
         try:
             guild = interaction.guild
             ch = await guild.create_text_channel("games", reason="MCWV games channel setup")
-            raw = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
+            raw = await async_db(db_get_setting, GAMES_SETTING_SPAWN_CHANNELS, "[]")
             try:
                 chans = json.loads(raw or "[]")
             except Exception:
                 chans = []
             if ch.id not in chans:
                 chans.append(ch.id)
-            await async_db(db_set_setting(GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans)))
+            await async_db(db_set_setting, GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans))
             guide = discord.Embed(
                 title="🎮 MCWV Games — Live Here!",
                 description=(
@@ -9948,7 +9961,7 @@ async def games_lottery(interaction: discord.Interaction, action: str, amount: i
         pool = games_lottery_pool()
         owned = await async_db(games_lottery_owned, interaction.user.id)
         try:
-            round_key = await async_db(games_lottery_round_key())
+            round_key = await async_db(games_lottery_round_key)
             def _db_step():
                 try:
                     with conn.cursor() as cur:
@@ -9996,12 +10009,12 @@ async def games_tower(interaction: discord.Interaction):
     if session and session.get("active"):
         return await interaction.followup.send(
             f"🏗 You're already climbing — floor **{session['floor']}**, {session['hearts']} ❤️ left.", ephemeral=True)
-    free_run, runs_today = await async_db(games_free_use(interaction.user.id, "tower"))
-    _dbv1_8900 = await async_db(games_is_unlimited(interaction.user.id))
+    free_run, runs_today = await async_db(games_free_use, interaction.user.id, "tower")
+    _dbv1_8900 = await async_db(games_is_unlimited, interaction.user.id)
     if not free_run and not _dbv1_8900:
         return await interaction.followup.send(
             f"❌ You've used all **{GAMES_TOWER_RUNS_PER_DAY}** tower runs in this 24h window — come back tomorrow!", ephemeral=True)
-    await async_db(games_coin_log_zero(interaction.user.id, "tower_run", meta={"runs_today": runs_today}))
+    await async_db(games_coin_log_zero, interaction.user.id, "tower_run", meta={"runs_today": runs_today})
     _started = time.time()
     ACTIVE_TOWER[interaction.user.id] = {
         "user_id": interaction.user.id, "floor": 1, "hearts": 3, "score": 0,
@@ -10145,7 +10158,7 @@ async def games_history_trivia(interaction: discord.Interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.user.id in ACTIVE_TRIVIA:
         return await interaction.followup.send("❌ You already have a trivia session running — finish it first!", ephemeral=True)
-    _dbv1_9041 = await async_db(games_is_unlimited(interaction.user.id))
+    _dbv1_9041 = await async_db(games_is_unlimited, interaction.user.id)
     if _dbv1_9041:
         allowed, retry_at = (True, None)
     else:
