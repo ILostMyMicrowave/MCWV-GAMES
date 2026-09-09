@@ -2744,94 +2744,6 @@ async def games_auto_equip_cosmetic(member, won):
     return "equipped"
 
 
-class EquipSelectView(discord.ui.View):
-    def __init__(self, member: discord.Member, owned: list):
-        super().__init__(timeout=120)
-        self.member = member
-        options = [discord.SelectOption(label=r.name, value=str(r.id), description=f"Cosmetic role id={r.id}") for r in owned]
-        self.select = discord.ui.Select(placeholder="Select cosmetic role to wear...", min_values=1, max_values=1, options=options)
-        self.select.callback = self.on_select
-        self.add_item(self.select)
-
-    async def on_select(self, interaction: discord.Interaction):
-        try:
-            await interaction.response.defer(ephemeral=True)
-            # Only one global claim allowed; check DB first (simple guard)
-            db_claim_done = False
-            try:
-                await async_db(_ensure_case_claim_table)
-                def _db_step():
-                    try:
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT 1 FROM user_case_claim WHERE discord_id = %s", (interaction.user.id,))
-                            if cur.fetchone():
-                                db_claim_done = True
-                        return db_claim_done
-                    except Exception:
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            pass
-                        raise
-                db_claim_done = await async_db(_db_step)
-            except Exception:
-                pass
-            if db_claim_done:
-                await interaction.followup.send("❌ This free case was already claimed by someone else!", ephemeral=True)
-                return
-            if interaction.user.id != self.member.id:
-                return await interaction.followup.send("❌ Not your selection.", ephemeral=True)
-            role_id = int(self.select.values[0])
-            guild = interaction.guild
-            if not guild:
-                return await interaction.followup.send("❌ Guild not found.", ephemeral=True)
-            try:
-                role = guild.get_role(role_id)
-            except Exception:
-                role = None
-            if not role:
-                return await interaction.followup.send("❌ Role not found.", ephemeral=True)
-            if int(role.id) not in COSMETIC_ROLE_IDS:
-                return await interaction.followup.send("❌ Not a cosmetic role.", ephemeral=True)
-            removed = []
-            for r in self.member.roles:
-                if int(r.id) in COSMETIC_ROLE_IDS and int(r.id) != int(role.id):
-                    try:
-                        await self.member.remove_roles(r, reason="Auto-cleanup /equip dropdown")
-                        removed.append(r.name)
-                    except Exception:
-                        pass
-            if role not in self.member.roles:
-                try:
-                    await self.member.add_roles(role, reason="Equipped via /equip dropdown")
-                except Exception as exc:
-                    return await interaction.followup.send(f"❌ Could not add role: {exc}", ephemeral=True)
-            _dbv1_2409 = await async_db(set_user_cosmetic_role, self.member.id, role.id)
-            if not _dbv1_2409:
-                # Role was granted on Discord; the DB mark failed. Tell the user
-                # rather than swallowing it (the /equip dropdown would re-offer
-                # stale state otherwise).
-                return await interaction.followup.send(
-                    f"⚠️ {role.name} equipped, but I couldn't save your selection — try again in a moment.",
-                    ephemeral=True,
-                )
-            removed_text = (" Removed others: " + ", ".join(removed) + ".") if removed else ""
-            embed = discord.Embed(title="✅ Equipped: {role.name}", description=f"You equipped **{role.name}** — only 1 cosmetic role allowed at a time.\nLast equipped: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} Zone.\n{removed_text}\n\nTip: Earn more from crates, then use `/equip` again.", color=discord.Color.green())
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            for child in self.children:
-                if isinstance(child, discord.ui.Select):
-                    child.disabled = True
-            try:
-                await interaction.followup.edit(view=self)
-            except Exception:
-                pass  # dropdown disable optional
-        except Exception as exc:
-            print(f"[equip] dropdown error: {exc}")
-            try:
-                await interaction.followup.send("❌ Equip failed.", ephemeral=True)
-            except Exception:
-                pass
-
 @bot.tree.command(name="pay", description="Send coins to another member", guild=guild_obj)
 @app_commands.describe(user="Who to pay", amount="Amount (min 10)")
 async def games_pay(interaction: discord.Interaction, user: discord.User, amount: int):
@@ -3476,6 +3388,77 @@ async def games_spawn(interaction: discord.Interaction, action: app_commands.Cho
 
 
 
+
+class EquipSelectView(discord.ui.View):
+    """/equip menu: pick which owned cosmetic to wear (highest tier first).
+    Ephemeral, single-user (only the member who ran /equip can pick), 2-minute
+    timeout. Picking a cosmetic wears it and removes any other currently-worn
+    cosmetic — the same single-wear rule as auto-equip and /equipsync."""
+
+    def __init__(self, member_id: int, role_options):
+        super().__init__(timeout=120)
+        self.member_id = int(member_id)
+        # The decorator below creates the select with a placeholder option;
+        # replace it with this member's owned cosmetics.
+        self.children[0].options = [
+            discord.components.SelectOption(label=str(name)[:100], value=str(int(rid)))
+            for rid, name in role_options[:25]
+        ]
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+    @discord.ui.select(
+        placeholder="Choose a cosmetic to wear",
+        min_values=1,
+        max_values=1,
+        options=[discord.components.SelectOption(label="\u2026", value="0")],
+    )
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if int(interaction.user.id) != self.member_id:
+            return await interaction.response.send_message(
+                "\u274c This menu belongs to the person who ran /equip.", ephemeral=True)
+        member = interaction.user
+        try:
+            chosen_id = int(select.values[0])
+        except (TypeError, ValueError, IndexError):
+            return
+        role = interaction.guild.get_role(chosen_id) if interaction.guild else None
+        if role is None:
+            return await interaction.response.send_message(
+                "\u274c That role no longer exists in the server.", ephemeral=True)
+        if role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Equipped via /equip")
+            except Exception as exc:
+                print(f"[games] /equip select: couldn't add role: {exc}")
+                return await interaction.response.send_message(
+                    "\u274c Couldn't equip that role (permissions or role order).", ephemeral=True)
+        hierarchy = await games_cosmetic_hierarchy()
+        cosmetic_ids = set(int(x) for x in hierarchy)
+        for r in member.roles:
+            if int(r.id) in cosmetic_ids and int(r.id) != chosen_id:
+                try:
+                    await member.remove_roles(r, reason="Replaced via /equip")
+                except Exception:
+                    pass
+        try:
+            await async_db(set_user_cosmetic_role, member.id, chosen_id)
+        except Exception:
+            pass
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.response.edit_message(
+                content=f"\U0001f3ad Now wearing **{role.name}**.", view=self)
+        except Exception:
+            pass
 
 @bot.tree.command(name="equip", description="Equip your cosmetic role (DB list)", guild=guild_obj)
 async def games_equip(interaction: discord.Interaction):
@@ -10346,6 +10329,8 @@ async def games_event_loop_watchdog():
 @bot.tree.error
 async def games_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     print(f"[interaction-error] command={getattr(interaction.command, 'name', 'unknown')} type={type(error).__name__}")
+    if getattr(error, "__traceback__", None):
+        print("".join(traceback.format_exception(type(error), error, error.__traceback__)))
     message = "⚠️ That action could not be completed. Please try again."
     try:
         if interaction.response.is_done():
