@@ -354,18 +354,14 @@ def test_no_blocking_db_on_event_loop():
     path = Path(__file__).parent / "games_bot.py"
     tree = ast.parse(path.read_text())
 
+    # Dynamic discovery (patch 09): the patch-02 hard-coded name list is
+    # exactly how 37 more call sites slipped through. Any sync function in
+    # the module that touches the shared `conn` is a blocking DB helper.
     DB_HELPER_NAMES = {
-        "games_coin_adjust", "games_coin_spend", "games_coin_transfer",
-        "games_coin_balance", "games_coin_log_zero", "games_coin_log_test",
-        "games_bank_move", "games_free_use", "games_prepaid_consume",
-        "games_petdle_solved_today", "games_coin_rank", "games_is_unlimited",
-        "get_user_cosmetic_roles", "set_user_cosmetic_role",
-        "games_track", "games_track_user", "games_track_participants",
-        "db_get_setting", "db_set_setting",
-        "_ensure_case_claim_table", "_ensure_cosmetic_table",
-        "games_jackpot_get", "games_get_eggs", "games_get_pets",
-        "games_featured_egg", "games_lottery_round_key",
-    }
+        n.name for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef)
+        and any(isinstance(x, ast.Name) and x.id == "conn" for x in ast.walk(n))
+    } - {"db_enabled"}  # only reads conn.closed and schedules a heal — no I/O
     async_fns = [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)]
 
     def enclosing_async(line):
@@ -405,19 +401,16 @@ def test_no_blocking_db_on_event_loop():
             fn = enclosing_async(n.lineno)
             if fn is None or in_nested_sync(n.lineno):
                 continue
-            cur = n
-            wrapped = False
-            while True:
-                p = parent_map.get(id(cur))
-                if p is None:
-                    break
-                if isinstance(p, ast.Call):
-                    name = p.func.id if isinstance(p.func, ast.Name) else getattr(p.func, "attr", "")
-                    if name in ("to_thread", "async_db"):
-                        wrapped = True
-                        break
-                cur = p
-            if not wrapped:
+            # Wrapped only if the IMMEDIATE enclosing call is a worker wrapper.
+            # Walking further up is how nested args slipped through: a helper
+            # evaluated synchronously to feed another call, e.g.
+            # async_db(f(... games_is_unlimited(...) ...)), still blocks the
+            # loop at argument-evaluation time.
+            p = parent_map.get(id(n))
+            p_name = None
+            if isinstance(p, ast.Call):
+                p_name = p.func.id if isinstance(p.func, ast.Name) else getattr(p.func, "attr", "")
+            if p_name not in ("to_thread", "async_db"):
                 problems.append(f"line {n.lineno}: {n.func.id}() in {fn.name}")
 
     assert not problems, "blocking DB access on the event loop:\n  " + "\n  ".join(problems)
@@ -718,6 +711,61 @@ def test_case_drop_flow():
         await view4.claim_btn.callback(inter5)
         assert inter5._msgs and inter5._msgs[0].embed is not None
         assert "nothing" in str(inter5._msgs[0].embed.description)
+
+        # A failure mid-claim still resolves the drop: the channel slot is
+        # freed, buttons disabled, the stuck "rolling…" message is cleared,
+        # and the clicker gets a clear (ephemeral) note.
+        real_choice = game.games_weighted_choice
+        game.games_weighted_choice = lambda *a, **k: 1 / 0
+        try:
+            view5 = make_view(11, 46, [role1], [100.0])
+            game.ACTIVE_CASE_DROPS[46] = view5.message
+            inter6 = FakeInteraction(444)
+            await view5.claim_btn.callback(inter6)
+        finally:
+            game.games_weighted_choice = real_choice
+        assert view5.claimed  # claim was locked in — no double-claim possible
+        assert 46 not in game.ACTIVE_CASE_DROPS  # channel slot freed
+        assert "drop roll failed" in (view5.message.content or "").lower()
+        assert all(child.disabled for child in view5.children)
+        assert any("drop roll failed" in (m.content or "") for m in inter6._msgs)
+
+        # Cosmetic auto-equip (shared by drop + paid /case): a win is saved to
+        # the /equip list AND worn per the highest-hierarchy rule; a lower win
+        # keeps the currently worn cosmetic.
+        class FakeMember:
+            def __init__(self, uid, roles):
+                self.id = uid
+                self.mention = f"<@{uid}>"
+                self.roles = list(roles)
+                self.added, self.removed = [], []
+
+            async def add_roles(self, r, reason=None):
+                self.added.append(r)
+                if r not in self.roles:
+                    self.roles.append(r)
+
+            async def remove_roles(self, r, reason=None):
+                self.removed.append(r)
+                self.roles = [x for x in self.roles if x is not r]
+
+        real_hierarchy, real_ids = game.COSMETIC_HIERARCHY, game.COSMETIC_ROLE_IDS
+        game.COSMETIC_HIERARCHY = [701, 700]  # 701 = higher tier
+        game.COSMETIC_ROLE_IDS = {700, 701}
+        try:
+            lo, hi = FakeRole(700), FakeRole(701)
+            m1 = FakeMember(501, [])
+            assert await game.games_auto_equip_cosmetic(m1, lo) == "equipped"
+            assert m1.added == [lo]
+            m2 = FakeMember(502, [hi])
+            assert await game.games_auto_equip_cosmetic(m2, lo) == "kept"
+            assert m2.added == []
+            m3 = FakeMember(503, [lo])
+            assert await game.games_auto_equip_cosmetic(m3, hi) == "equipped"
+            assert m3.added == [hi] and m3.removed == [lo]
+        finally:
+            game.COSMETIC_HIERARCHY = real_hierarchy
+            game.COSMETIC_ROLE_IDS = real_ids
 
     game.async_db = fake_async_db
     game.games_animate = fake_animate
