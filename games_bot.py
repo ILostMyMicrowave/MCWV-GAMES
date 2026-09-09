@@ -14,6 +14,7 @@ import re
 import secrets
 import threading
 import time
+import traceback
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -982,8 +983,8 @@ async def games_hub_embed(user):
         color=games_color("purple"),
     )
     embed.add_field(name="📅 Daily", value=daily_state, inline=True)
-    hatches_used, _, hatches_reset = games_free_status(user.id, "hatch")
-    spins_used, _, spins_reset = games_free_status(user.id, "spin")
+    hatches_used, _, hatches_reset = await async_db(games_free_status, user.id, "hatch")
+    spins_used, _, spins_reset = await async_db(games_free_status, user.id, "spin")
     hatches_txt = f"`{hatches_used}/{GAMES_HATCH_FREE_PER_DAY}` free"
     if hatches_reset:
         hatches_txt += f" · resets {discord.utils.format_dt(hatches_reset, 'R')}"
@@ -992,8 +993,8 @@ async def games_hub_embed(user):
         spins_txt += f" · resets {discord.utils.format_dt(spins_reset, 'R')}"
     embed.add_field(name="🥚 Hatches today", value=hatches_txt, inline=True)
     embed.add_field(name="🎡 Spins today", value=spins_txt, inline=True)
-    scratch_used, _, _scratch_reset = games_free_status(user.id, "scratch")
-    tower_used, _, tower_reset = games_free_status(user.id, "tower")
+    scratch_used, _, _scratch_reset = await async_db(games_free_status, user.id, "scratch")
+    tower_used, _, tower_reset = await async_db(games_free_status, user.id, "tower")
     _dbv1_962 = await async_db(games_petdle_solved_today(user.id))
     petdle_state = "✅ solved" if _dbv1_962 else "`/petdle`"
     embed.add_field(name="🐾 Petdle today", value=petdle_state, inline=True)
@@ -1136,7 +1137,7 @@ async def games_top_embed(user_id, games=None):
             description="\n".join(lines),
             color=games_color("purple"),
         )
-        my_wins = games_user_wins(user_id, games)
+        my_wins = await async_db(games_user_wins, user_id, games)
         embed.set_footer(text=f"Your {games} wins: {my_wins}")
         return embed
     try:
@@ -2516,7 +2517,7 @@ async def games_coins(interaction: discord.Interaction, user: discord.User = Non
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     target = user or interaction.user
-    embed = games_wallet_embed(target)
+    embed = await async_db(games_wallet_embed, target)
     view = CoinsQuickView(interaction.user.id)
     view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
 
@@ -2654,6 +2655,50 @@ COSMETIC_HIERARCHY = [
     1519468278374862939,
 ]
 # Lowest to highest; last = highest hierarchy cosmetic.
+
+async def games_auto_equip_cosmetic(member, won):
+    """Apply the /equip rule to a freshly won cosmetic: the highest-hierarchy
+    cosmetic is what gets worn (same rule as /equip and /equipsync).
+    Returns 'equipped' (now worn), 'kept' (a higher cosmetic stays worn), or
+    'listed' (saved to the /equip list only). Never raises."""
+    if not (hasattr(member, "roles") and hasattr(member, "add_roles")):
+        return "listed"
+    if won in member.roles:
+        return "equipped"
+    worn = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
+    if not worn:
+        try:
+            await member.add_roles(won, reason="Auto-equipped from case win")
+            return "equipped"
+        except Exception as exc:
+            print(f"[games] cosmetic auto-equip failed: {exc}")
+            return "listed"
+
+    def _rank(r):
+        try:
+            idx = COSMETIC_HIERARCHY.index(int(r.id))
+        except ValueError:
+            idx = len(COSMETIC_HIERARCHY)
+        # Ties keep the currently worn cosmetic; only a strictly higher tier
+        # replaces it.
+        return (idx, 1 if r is won else 0)
+
+    best = min([won] + worn, key=_rank)
+    if best is not won:
+        return "kept"
+    try:
+        await member.add_roles(won, reason="Auto-equipped from case win")
+    except Exception as exc:
+        print(f"[games] cosmetic auto-equip failed: {exc}")
+        return "listed"
+    for r in worn:
+        if int(r.id) != int(won.id):
+            try:
+                await member.remove_roles(r, reason="Lower cosmetic replaced by case win")
+            except Exception:
+                pass
+    return "equipped"
+
 
 class EquipSelectView(discord.ui.View):
     def __init__(self, member: discord.Member, owned: list):
@@ -3033,7 +3078,7 @@ class ShopView(discord.ui.View):
             await interaction.edit_original_response(view=self)
         except Exception:
             pass
-        ok, result = games_lottery_purchase(interaction.user.id, 1)
+        ok, result = await async_db(games_lottery_purchase, interaction.user.id, 1)
         if not ok:
             self._busy = False
             self.refresh_buttons(interaction.user.id)
@@ -3143,7 +3188,43 @@ class CaseDropView(discord.ui.View):
             state = "cancelled" if self.cancelled else "already claimed"
             return await interaction.response.send_message(f"❌ This drop was {state}.", ephemeral=True)
         self.claimed = True  # claim before the first await: near-simultaneous clicks can't both win
-        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as exc:
+            # The interaction itself is dead (expired token / gateway hiccup):
+            # the roll can't proceed, so retire the drop instead of leaking the
+            # exception to the global error handler.
+            print(f"[games] drop claim defer failed: {exc}")
+            print("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            try:
+                await self._retire("⚠️ The drop couldn't be claimed — the drop was cancelled.")
+            except Exception:
+                ACTIVE_CASE_DROPS.pop(self.channel_id, None)
+            try:
+                await interaction.response.send_message(
+                    "❌ The claim failed — the drop was cancelled.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            await self._claim_flow(interaction)
+        except Exception as exc:
+            print(f"[games] drop claim failed: {exc}")
+            print("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            # Whatever failed, resolve the drop: free the channel slot, disable
+            # the buttons, and clear the stuck "rolling…" message.
+            try:
+                await self._retire("⚠️ The drop roll failed — the drop was cancelled.")
+            except Exception:
+                ACTIVE_CASE_DROPS.pop(self.channel_id, None)
+            try:
+                await interaction.followup.send(
+                    "❌ The drop roll failed. Staff: check the bot logs.",
+                    ephemeral=True)
+            except Exception:
+                pass
+
+    async def _claim_flow(self, interaction):
         self._disable_all()
         try:
             await self.message.edit(content=f"🎲 {interaction.user.mention} claimed the drop — rolling…", view=self)
@@ -3166,6 +3247,7 @@ class CaseDropView(discord.ui.View):
         role_granted = False
         already_owned = False
         won_id = None
+        cosmetic_status = None
         if won is not None:
             won_id = int(won.id)
             member = interaction.user
@@ -3175,8 +3257,10 @@ class CaseDropView(discord.ui.View):
                 else:
                     try:
                         if int(won.id) in COSMETIC_ROLE_IDS:
-                            # Cosmetic: save to the owned list, /equip wears it.
+                            # Cosmetic: save to the /equip list, then apply the
+                            # /equip rule (highest hierarchy gets worn).
                             await async_db(set_user_cosmetic_role(member.id, int(won.id)))
+                            cosmetic_status = await games_auto_equip_cosmetic(member, won)
                             role_granted = True
                         else:
                             await member.add_roles(won, reason=f"Free drop — case '{self.case_name}'")
@@ -3225,7 +3309,11 @@ class CaseDropView(discord.ui.View):
             if already_owned:
                 reveal.add_field(name="Duplicate", value="Already owned — free drop, so no coin credit", inline=True)
             elif role_granted and int(won.id) in COSMETIC_ROLE_IDS:
-                reveal.add_field(name="Cosmetic", value="Saved to your list — run `/equip` to wear it!", inline=True)
+                cosmetic_value = {
+                    "equipped": "✨ Equipped! It's also in your `/equip` list.",
+                    "kept": "Added to your `/equip` list — you're already wearing a higher cosmetic.",
+                }.get(cosmetic_status, "Saved to your `/equip` list — run `/equip` to wear it.")
+                reveal.add_field(name="Cosmetic", value=cosmetic_value, inline=True)
         reveal.set_footer(text="Free staff drop · /spawn case")
         try:
             if roll_msg is not None:
@@ -3486,8 +3574,32 @@ class CaseConfirmView(discord.ui.View):
         self.rolled = True
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(view=self)
-        roll_msg = await interaction.followup.send("🎲 **Rolling…**", ephemeral=True)
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception as exc:
+            self.rolled = False
+            print(f"[games] case open ack failed: {exc}")
+            try:
+                await interaction.response.send_message(
+                    "❌ Couldn't start the roll — please try again.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            roll_msg = await interaction.followup.send("🎲 **Rolling…**", ephemeral=True)
+        except Exception as exc:
+            # Nothing was paid and no roll happened: let the user try again.
+            self.rolled = False
+            for child in self.children:
+                child.disabled = False
+            print(f"[games] case open roll message failed: {exc}")
+            try:
+                await interaction.response.edit_message(view=self)
+                await interaction.followup.send(
+                    "❌ The roll couldn't be started — try again.", ephemeral=True)
+            except Exception:
+                pass
+            return
         # hype frames: cycle through random possible prizes
         cycle = [r for r in self.roles if r is not None]
         frames = []
@@ -3515,10 +3627,22 @@ class CaseConfirmView(discord.ui.View):
             live_case = await async_db(_db_step)
             if not live_case or not live_case[1] or int(live_case[0]) != self.price:
                 self.rolled = False
-                return await roll_msg.edit(content="❌ This case changed or was disabled — run `/case` again.")
+                for child in self.children:
+                    child.disabled = False
+                try:
+                    await roll_msg.edit(content="❌ This case changed or was disabled — run `/case` again.")
+                except Exception:
+                    pass
+                return
         except Exception:
             self.rolled = False
-            return await roll_msg.edit(content="❌ Couldn't verify this case — you were not charged.")
+            for child in self.children:
+                child.disabled = False
+            try:
+                await roll_msg.edit(content="❌ Couldn't verify this case — you were not charged.")
+            except Exception:
+                pass
+            return
         ok, res = await async_db(games_coin_spend(interaction.user.id, self.price, "case_open", meta={"case": self.case_name}))
         if not ok:
             self.rolled = False
@@ -3555,6 +3679,7 @@ class CaseConfirmView(discord.ui.View):
 
         duplicate_credit = 0
         role_granted = False
+        cosmetic_status = None
         try:
             member = interaction.user
             if isinstance(member, discord.Member) and won in member.roles:
@@ -3563,14 +3688,19 @@ class CaseConfirmView(discord.ui.View):
                 await async_db(games_coin_adjust(member.id, duplicate_credit, "case_duplicate", meta={"case": self.case_name, "role": won.id}))
             elif isinstance(member, discord.Member):
                 if int(won.id) in COSMETIC_ROLE_IDS:
-                    # Cosmetic: save to list, don't auto-equip — use /equip
+                    # Cosmetic: save to the /equip list, then apply the /equip
+                    # rule (highest hierarchy gets worn).
                     await async_db(set_user_cosmetic_role(member.id, int(won.id)))
+                    cosmetic_status = await games_auto_equip_cosmetic(member, won)
                     role_granted = True
                     # Send reminder message (if interaction available; else skip silent)
                     try:
-                        await interaction.followup.send(
-                            f"🎭 **{won.name}** added to your cosmetic list! Run `/equip` to wear it.", ephemeral=True
-                        )
+                        cosmetic_note = {
+                            "equipped": f"🎭 **{won.name}** equipped! It's also in your `/equip` list.",
+                            "kept": f"🎭 **{won.name}** added to your `/equip` list — you're wearing a higher cosmetic, so it stays.",
+                        }.get(cosmetic_status,
+                              f"🎭 **{won.name}** added to your cosmetic list! Run `/equip` to wear it.")
+                        await interaction.followup.send(cosmetic_note, ephemeral=True)
                     except Exception:
                         pass
                 else:
@@ -3615,7 +3745,16 @@ class CaseConfirmView(discord.ui.View):
             inline=True,
         )
         reveal.set_footer(text=f"Case: {self.case_name} · /case {self.case_name} to roll again")
-        await roll_msg.edit(content=None, embed=reveal)
+        try:
+            await roll_msg.edit(content=None, embed=reveal)
+        except Exception as exc:
+            # The roll already happened (coins spent / role granted) — never
+            # reset `rolled` here; just try one more way to show the reveal.
+            print(f"[games] case reveal edit failed: {exc}")
+            try:
+                await interaction.followup.send(embed=reveal)
+            except Exception:
+                pass
 
 
 async def games_case_autocomplete(interaction: discord.Interaction, current: str):
@@ -4163,7 +4302,7 @@ async def games_guess_timeout(channel_id, started):
     games_guess_cancel_clock(channel_id)
     await async_db(games_session_end, f"guess:{channel_id}")
     if round_info.get("rewarded", True):
-        games_guess_record_result(round_info)
+        await async_db(games_guess_record_result, round_info)
         await async_db(games_track_participants("guess", round_info.get("participants"), winner_id=None))
     channel = bot.get_channel(channel_id)
     if channel is None:
@@ -4241,11 +4380,11 @@ async def games_start_guess_round(channel, pet_key=None, mode=None, rewarded=Tru
             if len(recent_modes) > 5:
                 recent_modes.pop(0)
 
-        asset_id = games_pet_asset(pet_key)
+        asset_id = await async_db(games_pet_asset, pet_key)
         icon = await games_fetch_pet_icon(asset_id) if asset_id else None
         image_buf = None
         if icon and mode != "letters":
-            image_buf = games_build_round_image(icon, mode)
+            image_buf = await asyncio.to_thread(games_build_round_image, icon, mode)
         if image_buf is None and mode != "letters":
             mode = "letters"
 
@@ -4423,7 +4562,7 @@ async def games_handle_answer(message):
     await async_db(games_session_end, f"guess:{message.channel.id}")
     elapsed = max(0.0, time.time() - float(round_info["started"]))
     rewarded_round = bool(round_info.get("rewarded", True))
-    previous = games_guess_profile(message.author.id)
+    previous = await async_db(games_guess_profile, message.author.id)
     reward = games_guess_reward(round_info, elapsed, previous.get("current_streak", 0))
     if reward > 0:
         paid, error = await async_db(games_coin_adjust(
@@ -4436,10 +4575,10 @@ async def games_handle_answer(message):
             reward = 0
     if rewarded_round:
         elapsed_ms = int(round(elapsed * 1000))
-        games_guess_record_result(round_info, message.author.id, reward, elapsed_ms)
+        await async_db(games_guess_record_result, round_info, message.author.id, reward, elapsed_ms)
         await async_db(games_track("guess", message.channel.id, sessions=0, minted=reward))
         await async_db(games_track_participants("guess", round_info.get("participants"), winner_id=message.author.id))
-        profile = games_guess_profile(message.author.id)
+        profile = await async_db(games_guess_profile, message.author.id)
     else:
         # Staff practice cannot farm coins, leaderboard wins, streaks or role progress.
         profile = previous
@@ -4475,7 +4614,7 @@ async def games_handle_answer(message):
         pet_file = None
         icon_bytes = round_info.get("icon")
         if icon_bytes is None:
-            asset = games_pet_asset(round_info["pet_name"])
+            asset = await async_db(games_pet_asset, round_info["pet_name"])
             if asset:
                 icon_bytes = await games_fetch_pet_icon(asset)
         if icon_bytes:
@@ -4528,7 +4667,7 @@ async def games_guess(interaction: discord.Interaction, action: str, mode: str =
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
 
     if action == "stats":
-        profile = games_guess_profile(interaction.user.id)
+        profile = await async_db(games_guess_profile, interaction.user.id)
         try:
             def _db_step():
                 try:
@@ -4923,7 +5062,7 @@ class DuelChallengeView(discord.ui.View):
         if not duel or duel["state"] != "pending":
             return await interaction.followup.send("That duel is no longer pending.", ephemeral=True)
         duel["state"] = "accepting"  # closes the double-click window before any DB work
-        ok, error = games_duel_escrow(duel)
+        ok, error = await async_db(games_duel_escrow, duel)
         if not ok:
             duel["state"] = "pending"
             return await interaction.followup.send(f"❌ Duel couldn't start: {error}", ephemeral=True)
@@ -4988,9 +5127,10 @@ async def start_duel_round(channel, duel):
     if game_type == "guess":
         pets = games_guess_pet_pool()
         pet = secrets.choice(pets)
-        icon = await games_fetch_pet_icon(games_pet_asset(pet))
+        _dbv1_9001 = await async_db(games_pet_asset, pet)
+        icon = await games_fetch_pet_icon(_dbv1_9001)
         if icon:
-            buf = games_build_round_image(icon, "zoom")
+            buf = await asyncio.to_thread(games_build_round_image, icon, "zoom")
             if buf:
                 duel["answer"] = pet
                 embed = discord.Embed(
@@ -5013,10 +5153,11 @@ async def start_duel_round(channel, duel):
             duel["answer"] = pet
             duel["exist_count"] = exist_count
             duel["exist_guesses"] = {}
-            icon = await games_fetch_pet_icon(games_pet_asset(pet))
+            _dbv1_9003 = await async_db(games_pet_asset, pet)
+            icon = await games_fetch_pet_icon(_dbv1_9003)
             file = None
             if icon:
-                buf = games_build_round_image(icon, "zoom")
+                buf = await asyncio.to_thread(games_build_round_image, icon, "zoom")
                 if buf:
                     file = discord.File(buf, filename="duel.png")
             if file:
@@ -5130,7 +5271,7 @@ async def settle_duel(duel_id, winner_id, reason):
     if not duel or duel.get("state") not in ("active", "settling"):
         return
     duel["state"] = "settling"  # blocks two simultaneous correct messages
-    ok, result = games_duel_settle_db(duel, winner_id if winner_id else None)
+    ok, result = await async_db(games_duel_settle_db, duel, winner_id if winner_id else None)
     if not ok:
         print(f"[games] duel {duel_id} settlement deferred: {result}")
         duel["state"] = "active"
@@ -5259,9 +5400,10 @@ async def games_scramble(interaction: discord.Interaction):
     if interaction.channel.id in ACTIVE_SCRAMBLE:
         return await interaction.followup.send("❌ A scramble is already active in this channel.", ephemeral=True)
     _dbv1_4589 = await async_db(games_is_unlimited(interaction.user.id))
-    allowed, retry_at = (True, None) if _dbv1_4589 else games_cooldown_claim(
-        interaction.channel.id, "scramble_channel", GAMES_SCRAMBLE_CHANNEL_COOLDOWN
-    )
+    if _dbv1_4589:
+        allowed, retry_at = (True, None)
+    else:
+        allowed, retry_at = await async_db(games_cooldown_claim, interaction.channel.id, "scramble_channel", GAMES_SCRAMBLE_CHANNEL_COOLDOWN)
     if not allowed:
         retry = discord.utils.format_dt(retry_at, "R") if retry_at else "in a moment"
         return await interaction.followup.send(f"⏳ This channel can start another scramble {retry}.", ephemeral=True)
@@ -5337,9 +5479,10 @@ async def games_hangman(interaction: discord.Interaction):
     if interaction.channel.id in ACTIVE_HANGMAN:
         return await interaction.followup.send("❌ A hangman game is already active here.", ephemeral=True)
     _dbv1_4659 = await async_db(games_is_unlimited(interaction.user.id))
-    allowed, retry_at = (True, None) if _dbv1_4659 else games_cooldown_claim(
-        interaction.channel.id, "hangman_channel", GAMES_HANGMAN_CHANNEL_COOLDOWN
-    )
+    if _dbv1_4659:
+        allowed, retry_at = (True, None)
+    else:
+        allowed, retry_at = await async_db(games_cooldown_claim, interaction.channel.id, "hangman_channel", GAMES_HANGMAN_CHANNEL_COOLDOWN)
     if not allowed:
         retry = discord.utils.format_dt(retry_at, "R") if retry_at else "in a moment"
         return await interaction.followup.send(f"⏳ This channel can start another hangman game {retry}.", ephemeral=True)
@@ -5593,7 +5736,7 @@ async def games_petdle(interaction: discord.Interaction, guess: str = None):
     await interaction.response.defer(ephemeral=True)
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
-    target = games_petdle_target()
+    target = await async_db(games_petdle_target)
     target_core = normalize_answer(target)
 
     if guess is None:
@@ -5640,7 +5783,7 @@ async def games_petdle(interaction: discord.Interaction, guess: str = None):
             ephemeral=True,
         )
 
-    result = games_petdle_submit(interaction.user.id, guess_clean, target)
+    result = await async_db(games_petdle_submit, interaction.user.id, guess_clean, target)
     if result["status"] == "error":
         return await interaction.followup.send("❌ Petdle couldn't save that guess. Try again.", ephemeral=True)
 
@@ -5669,7 +5812,7 @@ async def games_petdle(interaction: discord.Interaction, guess: str = None):
 
     file = None
     if won or lost:
-        asset = games_pet_asset(target)
+        asset = await async_db(games_pet_asset, target)
         icon = await games_fetch_pet_icon(asset) if asset else None
         file = games_icon_file(icon, "petdle.png", size=128) if icon else None
         if file:
@@ -5948,14 +6091,12 @@ async def games_spin(interaction: discord.Interaction):
 
     idx, label, rolled_amount, is_jackpot = games_spin_roll()
     jackpot_inc = secrets.randbelow(41) + 10  # jackpot grows 10-50 per spin
-    settlement = games_spin_settle(
-        interaction.user.id, label, rolled_amount, is_jackpot, jackpot_inc
-    )
+    settlement = await async_db(games_spin_settle, interaction.user.id, label, rolled_amount, is_jackpot, jackpot_inc)
     if not settlement.get("ok"):
         return await interaction.followup.send("❌ The spin couldn't be settled. Please contact staff.", ephemeral=True)
     amount = int(settlement.get("amount", 0))
     item = settlement.get("item")
-    wheel_buf = games_build_wheel_image(idx)
+    wheel_buf = await asyncio.to_thread(games_build_wheel_image, idx)
 
     embed = discord.Embed(title=f"{games_emoji('spin', '🎡')} Spin the Wheel", color=games_color("purple"))
     if is_jackpot:
@@ -6075,7 +6216,7 @@ async def games_scratch(interaction: discord.Interaction):
         else:
             tier_weights.append(100)
     picks = [games_weighted_choice(pool, tier_weights) for _ in range(3)]
-    picks, pity_triggered, pity_misses = games_scratch_apply_pity(interaction.user.id, picks)
+    picks, pity_triggered, pity_misses = await async_db(games_scratch_apply_pity, interaction.user.id, picks)
     count_map = {}
     for p in picks:
         count_map[p] = count_map.get(p, 0) + 1
@@ -7783,8 +7924,10 @@ async def games_trivia(interaction: discord.Interaction):
     if interaction.user.id in ACTIVE_TRIVIA:
         return await interaction.followup.send("❌ You already have a trivia session running — finish it first!", ephemeral=True)
     _dbv1_6955 = await async_db(games_is_unlimited(interaction.user.id))
-    allowed, retry_at = (True, None) if _dbv1_6955 else \
-        games_cooldown_claim(interaction.user.id, "trivia", GAMES_TRIVIA_COOLDOWN)
+    if _dbv1_6955:
+        allowed, retry_at = (True, None)
+    else:
+        allowed, retry_at = await async_db(games_cooldown_claim, interaction.user.id, "trivia", GAMES_TRIVIA_COOLDOWN)
     if not allowed:
         retry = discord.utils.format_dt(retry_at, "R") if retry_at else "soon"
         return await interaction.followup.send(f"⏳ Your next trivia run is available {retry}.", ephemeral=True)
@@ -8243,11 +8386,12 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
     except Exception as exc:
         print(f"[games] collection upsert failed: {exc}")
 
-    asset_id = games_pet_asset(pet_name)
+    asset_id = await async_db(games_pet_asset, pet_name)
     icon = await games_fetch_pet_icon(asset_id) if asset_id else None
+    _dbv1_9002 = await async_db(games_is_unlimited, interaction.user.id)
     await async_db(games_track(
         "hatch", interaction.channel_id,
-        burned=0 if free or games_is_unlimited(interaction.user.id) else GAMES_HATCH_COST,
+        burned=0 if free or _dbv1_9002 else GAMES_HATCH_COST,
     ))
     await async_db(games_track_user("hatch", interaction.user.id, win=tier in ("titanic", "huge", "gargantuan")))
 
@@ -8766,7 +8910,7 @@ async def games_lottery_draw_async(channel):
 
 # ---------- STREAK ROLES: duelist ----------
 async def games_check_duelist_role(guild, winner_id):
-    wins = games_user_wins(winner_id, "duel")
+    wins = await async_db(games_user_wins, winner_id, "duel")
     if wins > 0 and wins % 5 == 0:
         await games_grant_role(guild, winner_id, "duelist")
 
@@ -8878,7 +9022,7 @@ async def games_build_scratch_strip(pet_names, covered=False):
     if not covered:
         any_icon = False
         for name in pet_names:
-            asset = games_pet_asset(name)
+            asset = await async_db(games_pet_asset, name)
             img = None
             if asset:
                 icon = await games_fetch_pet_icon(asset)
@@ -8993,7 +9137,7 @@ async def games_post_hint(channel, round_info):
         games_footer(embed, "Only real pet names consume attempts · 🔥 close · 🟡 warm · ❌ cold")
         file = None
         if step == 1 and round_info.get("icon"):
-            reveal = games_build_round_image(round_info["icon"], "reveal")
+            reveal = await asyncio.to_thread(games_build_round_image, round_info["icon"], "reveal")
             if reveal:
                 file = discord.File(reveal, filename="hint_pet.png")
                 embed.set_thumbnail(url="attachment://hint_pet.png")
@@ -9191,11 +9335,11 @@ async def games_tower_ask_chat(channel, user_id):
         pet = games_pick_random(pets, scope=f"tower_pet:{user_id}", max_recent=8)
         session["answer"] = pet
         session["kind"] = "guess"
-        asset = games_pet_asset(pet)
+        asset = await async_db(games_pet_asset, pet)
         icon = await games_fetch_pet_icon(asset) if asset else None
         file = None
         if icon:
-            buf = games_build_round_image(icon, "zoom")
+            buf = await asyncio.to_thread(games_build_round_image, icon, "zoom")
             if buf:
                 file = discord.File(buf, filename="tower.png")
         embed = discord.Embed(title=f"🏗 Floor {session['floor']} — Name this pet!", color=games_color("purple"))
@@ -9366,7 +9510,7 @@ class GameStaffRoleSelect(discord.ui.RoleSelect):
                 f"❌ `@everyone` and managed/integration roles cannot be game staff: {names}", ephemeral=True
             )
         await interaction.response.defer(ephemeral=True)
-        ok, result = games_set_staff_role_ids(role.id for role in roles)
+        ok, result = await async_db(games_set_staff_role_ids, [role.id for role in roles])
         if not ok:
             return await interaction.followup.send(f"❌ Could not save roles: `{result}`", ephemeral=True)
         new_view = GameStaffRoleView(view.owner_id)
@@ -9402,7 +9546,7 @@ class GameStaffRoleView(discord.ui.View):
     @discord.ui.button(label="Clear Roles (Owner Only)", style=discord.ButtonStyle.danger, emoji="🧹", row=1)
     async def clear_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        ok, result = games_set_staff_role_ids([])
+        ok, result = await async_db(games_set_staff_role_ids, [])
         if not ok:
             return await interaction.followup.send(f"❌ Could not clear roles: `{result}`", ephemeral=True)
         new_view = GameStaffRoleView(self.owner_id)
@@ -9782,11 +9926,11 @@ async def games_lottery(interaction: discord.Interaction, action: str, amount: i
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if action == "buy":
         n = max(1, int(amount))
-        owned = games_lottery_owned(interaction.user.id)
+        owned = await async_db(games_lottery_owned, interaction.user.id)
         if owned + n > GAMES_LOTTERY_WEEKLY_TICKET_CAP:
             return await interaction.followup.send(
                 f"❌ Weekly cap is **{GAMES_LOTTERY_WEEKLY_TICKET_CAP}** tickets — you already hold {owned}.", ephemeral=True)
-        ok, result = games_lottery_purchase(interaction.user.id, n)
+        ok, result = await async_db(games_lottery_purchase, interaction.user.id, n)
         if not ok:
             return await interaction.followup.send(f"❌ {result}", ephemeral=True)
         embed = discord.Embed(
@@ -9802,7 +9946,7 @@ async def games_lottery(interaction: discord.Interaction, action: str, amount: i
         return
     if action == "view":
         pool = games_lottery_pool()
-        owned = games_lottery_owned(interaction.user.id)
+        owned = await async_db(games_lottery_owned, interaction.user.id)
         try:
             round_key = await async_db(games_lottery_round_key())
             def _db_step():
@@ -10002,9 +10146,10 @@ async def games_history_trivia(interaction: discord.Interaction):
     if interaction.user.id in ACTIVE_TRIVIA:
         return await interaction.followup.send("❌ You already have a trivia session running — finish it first!", ephemeral=True)
     _dbv1_9041 = await async_db(games_is_unlimited(interaction.user.id))
-    allowed, retry_at = (True, None) if _dbv1_9041 else games_cooldown_claim(
-        interaction.user.id, "historytrivia", GAMES_HISTORY_TRIVIA_COOLDOWN
-    )
+    if _dbv1_9041:
+        allowed, retry_at = (True, None)
+    else:
+        allowed, retry_at = await async_db(games_cooldown_claim, interaction.user.id, "historytrivia", GAMES_HISTORY_TRIVIA_COOLDOWN)
     if not allowed:
         retry = discord.utils.format_dt(retry_at, "R") if retry_at else "soon"
         return await interaction.followup.send(f"⏳ Your next history run is available {retry}.", ephemeral=True)
@@ -10099,7 +10244,9 @@ async def games_app_command_error(interaction: discord.Interaction, error: app_c
 
 
 async def _games_view_on_error(self, interaction: discord.Interaction, error: Exception, item):
-    print(f"[component-error] item={type(item).__name__} type={type(error).__name__}")
+    print(f"[component-error] item={type(item).__name__} type={type(error).__name__}: {error}")
+    if getattr(error, "__traceback__", None):
+        print("".join(traceback.format_exception(type(error), error, error.__traceback__)))
     try:
         if interaction.response.is_done():
             await interaction.followup.send("⚠️ That control failed safely. Please try again.", ephemeral=True)
@@ -10110,7 +10257,9 @@ async def _games_view_on_error(self, interaction: discord.Interaction, error: Ex
 
 
 async def _games_modal_on_error(self, interaction: discord.Interaction, error: Exception):
-    print(f"[modal-error] modal={type(self).__name__} type={type(error).__name__}")
+    print(f"[modal-error] modal={type(self).__name__} type={type(error).__name__}: {error}")
+    if getattr(error, "__traceback__", None):
+        print("".join(traceback.format_exception(type(error), error, error.__traceback__)))
     try:
         if interaction.response.is_done():
             await interaction.followup.send("⚠️ That form failed safely. Please try again.", ephemeral=True)
