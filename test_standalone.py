@@ -15,7 +15,7 @@ import games_bot as game
 def test_registration_and_health():
     commands = game.bot.tree.get_commands(guild=game.guild_obj)
     names = {command.name for command in commands}
-    assert len(commands) == 30
+    assert len(commands) == 33
     assert {"games", "guess", "shop", "caseadmin", "gamesadmin"} <= names
     assert not ({"ticket", "giveaway", "warinfo", "add", "invite"} & names)
     original_probe = game.games_database_probe
@@ -237,7 +237,7 @@ def test_every_slash_command_defers_first():
         assert isinstance(call, ast.Call), function.name
         assert isinstance(call.func, ast.Attribute) and call.func.attr == "defer", function.name
         checked.append(function.name)
-    assert len(checked) == 30
+    assert len(checked) == 33
 
     autocomplete_names = {
         "games_case_autocomplete",
@@ -338,7 +338,227 @@ def test_every_slash_command_defers_first():
                     assert not any(fragment in name for fragment in dangerous_fragments), (
                         class_node.name, function.name, node.lineno, name
                     )
-    assert len(callbacks) == 44
+    assert len(callbacks) == 45
+
+
+def test_no_blocking_db_on_event_loop():
+    """Regression guard: async (event-loop) code must never touch the shared
+    Postgres connection directly, and must not call the blocking DB helpers
+    without going through asyncio.to_thread / async_db.
+
+    Blocking Postgres on the loop freezes every user's interactions for the
+    duration of the query — this test fails loudly if that ever comes back.
+    """
+    import ast
+    path = Path(__file__).parent / "games_bot.py"
+    tree = ast.parse(path.read_text())
+
+    DB_HELPER_NAMES = {
+        "games_coin_adjust", "games_coin_spend", "games_coin_transfer",
+        "games_coin_balance", "games_coin_log_zero", "games_coin_log_test",
+        "games_bank_move", "games_free_use", "games_prepaid_consume",
+        "games_petdle_solved_today", "games_coin_rank", "games_is_unlimited",
+        "get_user_cosmetic_roles", "set_user_cosmetic_role",
+        "games_track", "games_track_user", "games_track_participants",
+        "db_get_setting", "db_set_setting",
+        "_ensure_case_claim_table", "_ensure_cosmetic_table",
+        "games_jackpot_get", "games_get_eggs", "games_get_pets",
+        "games_featured_egg", "games_lottery_round_key",
+    }
+    async_fns = [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)]
+
+    def enclosing_async(line):
+        best = None
+        for n in async_fns:
+            if n.lineno <= line <= n.end_lineno:
+                if best is None or n.lineno > best.lineno:
+                    best = n
+        return best
+
+    sync_in_async = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and enclosing_async(n.lineno) is not None
+    ]
+
+    def in_nested_sync(line):
+        return any(n.lineno <= line <= n.end_lineno for n in sync_in_async)
+
+    parent_map = {}
+    for n in ast.walk(tree):
+        for ch in ast.iter_child_nodes(n):
+            parent_map[id(ch)] = n
+
+    problems = []
+    for n in ast.walk(tree):
+        # direct shared-connection access in async bodies
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "conn":
+            fn = enclosing_async(n.lineno)
+            if fn is None or in_nested_sync(n.lineno):
+                continue
+            # benign: status reads, and the shutdown close()
+            if n.attr == "closed" or (fn.name == "close" and n.attr == "close"):
+                continue
+            problems.append(f"line {n.lineno}: conn.{n.attr} in {fn.name}")
+        # blocking helper called directly from an async body
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in DB_HELPER_NAMES:
+            fn = enclosing_async(n.lineno)
+            if fn is None or in_nested_sync(n.lineno):
+                continue
+            cur = n
+            wrapped = False
+            while True:
+                p = parent_map.get(id(cur))
+                if p is None:
+                    break
+                if isinstance(p, ast.Call):
+                    name = p.func.id if isinstance(p.func, ast.Name) else getattr(p.func, "attr", "")
+                    if name in ("to_thread", "async_db"):
+                        wrapped = True
+                        break
+                cur = p
+            if not wrapped:
+                problems.append(f"line {n.lineno}: {n.func.id}() in {fn.name}")
+
+    assert not problems, "blocking DB access on the event loop:\n  " + "\n  ".join(problems)
+
+
+def test_session_restart_recovery():
+    """Restart recovery: live rounds restore, expired ones reveal, tower runs
+    settle like the live clock, and `ended` tombstones are dropped."""
+    sent = []
+    rows = {}
+    calls = {"tower_timeout": [], "tower_ask": []}
+
+    class FakeChannel:
+        def __init__(self, cid):
+            self.id = cid
+
+        async def send(self, **kwargs):
+            sent.append((self.id, kwargs))
+
+    async def fake_async_db(fn, *args, **kwargs):
+        if fn is game.games_session_load:
+            return list(rows.values())
+        if fn is game.games_session_delete:
+            rows.pop(str(args[0]), None)
+            return True
+        if fn is game.games_session_end:
+            rows[str(args[0])][2]["ended"] = True
+            return True
+        return None
+
+    now = game.time.time()
+    rows["guess:101"] = ("guess:101", "guess", {
+        "channel_id": 101, "started": now - 10, "pet_name": "Huge Pet", "mode": "zoom",
+        "rewarded": True, "participants": [1], "message_id": 5,
+    })
+    rows["guess:102"] = ("guess:102", "guess", {
+        "channel_id": 102, "started": now - 200, "pet_name": "Titanic Cat", "mode": "zoom",
+        "rewarded": True, "participants": [], "message_id": 6,
+    })
+    rows["scramble:103"] = ("scramble:103", "scramble", {
+        "channel_id": 103, "started": now - 30, "answer": "Huge Fox", "participants": [],
+    })
+    rows["hangman:104"] = ("hangman:104", "hangman", {
+        "channel_id": 104, "started": now - 400, "word": "Huge Dog", "core": "hugedog", "participants": [],
+    })
+    rows["tower:201"] = ("tower:201", "tower", {
+        "user_id": 201, "floor": 3, "hearts": 2, "score": 100, "combo": 1, "active": True,
+        "started": now - 300, "floor_started": now - 10, "channel_id": 301,
+        "kind": "trivia", "trivia_answer": "A", "trivia_options": ["A", "B"],
+    })
+    rows["tower:202"] = ("tower:202", "tower", {
+        "user_id": 202, "floor": 5, "hearts": 3, "score": 0, "combo": 0, "active": True,
+        "started": now - 600, "floor_started": now - 120, "channel_id": 302,
+        "kind": "guess", "answer": "Huge Cat",
+    })
+    rows["tower:203"] = ("tower:203", "tower", {
+        "user_id": 203, "floor": 2, "hearts": 3, "score": 25, "combo": 0, "active": True,
+        "started": now - 100, "floor_started": now - 100, "channel_id": 303,
+        "kind": None,
+    })
+    rows["tower:204"] = ("tower:204", "tower", {
+        "user_id": 204, "floor": 2, "hearts": 3, "score": 25, "combo": 0, "active": True,
+        "started": now - 100, "floor_started": now - 100, "channel_id": 999,
+        "kind": None,
+    })
+    rows["guess:105"] = ("guess:105", "guess", {
+        "channel_id": 105, "started": now - 10, "pet_name": "Huge Owl", "mode": "zoom",
+        "rewarded": True, "participants": [], "message_id": 7, "ended": True,
+    })
+
+    real = {
+        name: getattr(game, name)
+        for name in (
+            "async_db", "games_guess_clock", "games_tower_timeout", "games_tower_ask_chat",
+        )
+    }
+    real_fetch, real_get = game.bot.fetch_channel, game.bot.get_channel
+
+    async def stub_clock(channel_id, started):
+        return None
+
+    async def stub_tower_timeout(user_id, session):
+        calls["tower_timeout"].append(user_id)
+
+    async def stub_tower_ask(channel, user_id):
+        calls["tower_ask"].append((channel.id, user_id))
+
+    async def fake_fetch_channel(cid):
+        return FakeChannel(cid)
+
+    game.async_db = fake_async_db
+    game.games_guess_clock = stub_clock
+    game.games_tower_timeout = stub_tower_timeout
+    game.games_tower_ask_chat = stub_tower_ask
+    game.bot.fetch_channel = fake_fetch_channel
+    game.bot.get_channel = lambda cid: FakeChannel(cid) if cid in (301, 302, 303) else None
+    try:
+        asyncio.run(game.games_recover_sessions())
+
+        # Live rounds were restored (guess clock re-armed, row left alone).
+        g101 = game.ACTIVE_GUESS_ROUNDS.get(101)
+        assert g101 and g101["pet_name"] == "Huge Pet" and g101["started"] == now - 10
+        assert g101["participants"] == {1}
+        assert 101 in game.ACTIVE_GUESS_TASKS
+        assert "guess:101" in rows and not rows["guess:101"][2].get("ended")
+        assert game.ACTIVE_SCRAMBLE.get(103, {}).get("answer") == "Huge Fox"
+        t201 = game.ACTIVE_TOWER.get(201)
+        assert t201 and t201["floor"] == 3 and t201["kind"] == "trivia" and t201["active"]
+
+        # Tower past the floor deadline settles like the live timeout; a
+        # between-floors restart re-asks the floor; a lost channel ends the run.
+        assert calls["tower_timeout"] == [202]
+        assert calls["tower_ask"] == [(303, 203)]
+        t204 = game.ACTIVE_TOWER.get(204)
+        assert t204 and t204["active"] is False
+        assert rows["tower:204"][2].get("ended") is True
+
+        # Expired rounds revealed their answers and their rows were dropped.
+        titles = " | ".join(
+            str(kwargs.get("embed").title)
+            for _cid, kwargs in sent
+            if kwargs.get("embed") is not None
+        )
+        assert "nobody got it" in titles, titles
+        assert "Hangman Expired" in titles, titles
+        assert "guess:102" not in rows and "hangman:104" not in rows
+        assert 102 not in game.ACTIVE_GUESS_ROUNDS and 104 not in game.ACTIVE_HANGMAN
+
+        # `ended` tombstones are removed without restoring the round.
+        assert "guess:105" not in rows
+        assert 105 not in game.ACTIVE_GUESS_ROUNDS
+    finally:
+        for name, value in real.items():
+            setattr(game, name, value)
+        game.bot.fetch_channel, game.bot.get_channel = real_fetch, real_get
+        for task in list(game.ACTIVE_GUESS_TASKS.values()):
+            task.cancel()
+        game.ACTIVE_GUESS_TASKS.clear()
+        game.ACTIVE_GUESS_ROUNDS.clear()
+        game.ACTIVE_SCRAMBLE.clear()
+        game.ACTIVE_HANGMAN.clear()
+        game.ACTIVE_TOWER.clear()
 
 
 if __name__ == "__main__":
@@ -347,4 +567,6 @@ if __name__ == "__main__":
     test_guess_pure_logic_and_images()
     test_async_lifecycle()
     test_every_slash_command_defers_first()
+    test_no_blocking_db_on_event_loop()
+    test_session_restart_recovery()
     print("standalone checks passed")
