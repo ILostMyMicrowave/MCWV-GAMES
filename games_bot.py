@@ -2679,9 +2679,11 @@ COSMETIC_SETTING_KEY = "games_cosmetic_role_ids"
 async def games_cosmetic_hierarchy():
     """Ordered list of equip-able cosmetic role IDs (highest tier first).
 
-    Staff can reconfigure this via /gamesadmin "equip cosmetics set <ids>"
-    (stored in the settings table) — e.g. to register roles added to cases
-    after launch. Until configured, the built-in pet cosmetics apply.
+    Staff can extend this via /gamesadmin "equip cosmetics set <ids>"
+    (stored in the settings table) — the given role IDs are ADDED to the
+    current list as the lowest tier, not used to replace it. E.g. to
+    register roles added to cases after launch. Until configured, the
+    built-in pet cosmetics apply; "equip cosmetics reset" restores them.
     """
     raw = await async_db(db_get_setting, COSMETIC_SETTING_KEY, "")
     if raw:
@@ -2696,6 +2698,24 @@ async def games_cosmetic_hierarchy():
         except Exception:
             pass
     return list(COSMETIC_HIERARCHY)
+
+
+def games_cosmetic_merge(current_ids, new_ids, cap=25):
+    """Merge new_ids into current_ids for /gamesadmin 'equip cosmetics
+    set', which ADDS to the equip-able list (highest-tier-first order)
+    instead of replacing it. New roles join as the lowest tier (end of
+    the list). De-duplicated (existing order wins) and capped at `cap`.
+    Returns (merged, added, truncated): `added` lists the ids actually
+    present in `merged` that were not already in `current_ids`."""
+    merged = list(current_ids)
+    for rid in new_ids:
+        if rid not in merged:
+            merged.append(rid)
+    truncated = len(merged) > cap
+    merged = merged[:cap]
+    current_set = set(current_ids)
+    added = [r for r in merged if r not in current_set]
+    return merged, added, truncated
 
 
 async def games_auto_equip_cosmetic(member, won):
@@ -9868,7 +9888,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
                          "auto-equipped (highest tier first).\n\n" + "\n".join(lines[:25])),
             color=discord.Color.purple(),
         )
-        embed.set_footer(text="Replace with 'equip cosmetics set <ids>' · restore defaults with 'equip cosmetics reset'")
+        embed.set_footer(text="Add roles with 'equip cosmetics set <ids>' (lowest tier) · restore defaults with 'equip cosmetics reset'")
         return await interaction.followup.send(embed=embed, ephemeral=True)
 
     if action == "cosmetics_set":
@@ -9880,21 +9900,30 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
                     ids.append(rid)
         if not ids:
             return await interaction.followup.send(
-                "❌ Provide role IDs: `cosmetics set 123456,789012` (highest tier first, comma-separated). "
+                "❌ Provide role IDs: `cosmetics set 123456,789012` (comma-separated). "
                 "Get a role ID: Developer Mode → right-click the role → Copy Role ID.", ephemeral=True)
-        if len(ids) > 25:
-            ids = ids[:25]
-        ok = await async_db(db_set_setting, COSMETIC_SETTING_KEY, json.dumps(ids))
+        # ADD to the current list (built-in fallback included) — never replace.
+        # New roles join as the lowest tier (end of the highest-first list).
+        current = await games_cosmetic_hierarchy()
+        merged, added, truncated = games_cosmetic_merge(current, ids)
+        ok = await async_db(db_set_setting, COSMETIC_SETTING_KEY, json.dumps(merged))
         if not ok:
             return await interaction.followup.send("❌ Could not save — database unavailable.", ephemeral=True)
         guild = interaction.guild
-        lines = []
-        for rid in ids:
+
+        def _label(rid):
             role = guild.get_role(rid) if guild else None
-            lines.append(f"• {role.mention if role else 'missing role'} — `{rid}`")
-        return await interaction.followup.send(
-            f"✅ Equip-able cosmetics updated ({len(ids)} roles, highest tier first):\n" + "\n".join(lines),
-            ephemeral=True)
+            return role.mention if role else f"missing role `{rid}`"
+
+        if added:
+            body = "Added to the equip-able cosmetics list (new roles are the lowest tier):\n" + "\n".join(
+                f"+ {_label(r)}" for r in added)
+        else:
+            body = "Those role(s) were already on the equip-able cosmetics list — nothing to add."
+        if truncated:
+            body += "\n⚠️ The list is capped at 25 roles — some additions were dropped."
+        body += f"\nTotal now: {len(merged)} (highest tier first)."
+        return await interaction.followup.send("✅ " + body, ephemeral=True)
 
     if action == "cosmetics_reset":
         ok = await async_db(db_set_setting, COSMETIC_SETTING_KEY, "")
