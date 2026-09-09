@@ -13,7 +13,7 @@ This project has its own:
 - health endpoint and logs
 
 It does **not** contain ticket, application, clan-management, invite, giveaway,
-war-management, dashboard, or MCWV admin-web commands. Its 30 registered guild
+war-management, dashboard, or MCWV admin-web commands. Its 33 registered guild
 commands are game/economy commands only.
 
 Nothing in this repository automatically modifies or deploys MCWV BOT. Do not
@@ -25,7 +25,7 @@ reuse MCWV BOT's Discord token or edit its Render service when deploying this bo
 `/withdraw`, `/shop`, `/cases`, `/case`, `/caseadmin`, `/coinsadmin`, `/guess`,
 `/pets`, `/hatch`, `/eggs`, `/duel`, `/scramble`, `/hangman`, `/petdle`, `/spin`,
 `/scratch`, `/bingo`, `/trivia`, `/historytrivia`, `/lottery`, `/tower`,
-`/toweranswer`, and `/top`.
+`/toweranswer`, `/top`, `/equip`, `/equipsync`, and `/spawn`.
 
 ## 1. Create the Discord application
 
@@ -185,5 +185,5 @@ GUILD_ID=1501608673250640055 python -c \
   "import games_bot; print(len(games_bot.bot.tree.get_commands(guild=games_bot.guild_obj)))"
 ```
 
-The expected command count is `30`. The standalone suite also enforces early
+The expected command count is `33`. The standalone suite also enforces early
 acknowledgement for all slash commands and every audited component/modal callback.
