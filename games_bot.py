@@ -1260,13 +1260,15 @@ def _ensure_cosmetic_table():
     except Exception as e:
         print(f"[cosmetic_table] init error: {e}")
 
-def _highest_cosmetic_role(roles):
-    """Return highest hierarchy cosmetic role from a list of roles."""
-    owned = [r for r in roles if int(r.id) in COSMETIC_ROLE_IDS]
+def _highest_cosmetic_role(roles, hierarchy):
+    """Return highest hierarchy cosmetic role from a list of roles.
+    `hierarchy` is the ordered (highest-first) list of equip-able role ids."""
+    ids = set(int(x) for x in hierarchy)
+    owned = [r for r in roles if int(r.id) in ids]
     if not owned:
         return None
-    # Higher = later in hierarchy list; use index as rank
-    best = min(owned, key=lambda r: COSMETIC_HIERARCHY.index(int(r.id)) if int(r.id) in COSMETIC_HIERARCHY else 9999)
+    # Lower index = higher tier (list is highest-first)
+    best = min(owned, key=lambda r: hierarchy.index(int(r.id)) if int(r.id) in ids else len(hierarchy))
     return best
 
 async def record_initial_cosmetic_roles():
@@ -1274,6 +1276,8 @@ async def record_initial_cosmetic_roles():
     if not db_enabled() or not conn:
         return
     await async_db(_ensure_cosmetic_table)
+    hierarchy = await games_cosmetic_hierarchy()
+    cosmetic_ids = set(int(x) for x in hierarchy)
     try:
         guild = bot.get_guild(GUILD_ID)
         if not guild:
@@ -1281,7 +1285,7 @@ async def record_initial_cosmetic_roles():
         for member in guild.members:
             if not member or member.bot:
                 continue
-            owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
+            owned = [r for r in member.roles if int(r.id) in cosmetic_ids]
             if not owned:
                 continue
             # Save ALL currently owned cosmetic roles to DB
@@ -1291,7 +1295,7 @@ async def record_initial_cosmetic_roles():
                 except Exception:
                     pass
             # Auto-equip only highest hierarchy
-            best = _highest_cosmetic_role(owned)
+            best = _highest_cosmetic_role(owned, hierarchy)
             if best:
                 for r in owned:
                     if int(r.id) != int(best.id):
@@ -2669,6 +2673,31 @@ COSMETIC_HIERARCHY = [
 ]
 # Lowest to highest; last = highest hierarchy cosmetic.
 
+COSMETIC_SETTING_KEY = "games_cosmetic_role_ids"
+
+
+async def games_cosmetic_hierarchy():
+    """Ordered list of equip-able cosmetic role IDs (highest tier first).
+
+    Staff can reconfigure this via /gamesadmin "equip cosmetics set <ids>"
+    (stored in the settings table) — e.g. to register roles added to cases
+    after launch. Until configured, the built-in pet cosmetics apply.
+    """
+    raw = await async_db(db_get_setting, COSMETIC_SETTING_KEY, "")
+    if raw:
+        try:
+            ids = []
+            for item in json.loads(raw):
+                rid = int(item)
+                if rid > 0 and rid not in ids:
+                    ids.append(rid)
+            if ids:
+                return ids[:25]
+        except Exception:
+            pass
+    return list(COSMETIC_HIERARCHY)
+
+
 async def games_auto_equip_cosmetic(member, won):
     """Apply the /equip rule to a freshly won cosmetic: the highest-hierarchy
     cosmetic is what gets worn (same rule as /equip and /equipsync).
@@ -2678,7 +2707,9 @@ async def games_auto_equip_cosmetic(member, won):
         return "listed"
     if won in member.roles:
         return "equipped"
-    worn = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
+    hierarchy = await games_cosmetic_hierarchy()
+    cosmetic_ids = set(int(x) for x in hierarchy)
+    worn = [r for r in member.roles if int(r.id) in cosmetic_ids]
     if not worn:
         try:
             await member.add_roles(won, reason="Auto-equipped from case win")
@@ -2689,9 +2720,9 @@ async def games_auto_equip_cosmetic(member, won):
 
     def _rank(r):
         try:
-            idx = COSMETIC_HIERARCHY.index(int(r.id))
+            idx = hierarchy.index(int(r.id))
         except ValueError:
-            idx = len(COSMETIC_HIERARCHY)
+            idx = len(hierarchy)
         # Ties keep the currently worn cosmetic; only a strictly higher tier
         # replaces it.
         return (idx, 1 if r is won else 0)
@@ -3165,7 +3196,7 @@ class CaseDropView(discord.ui.View):
     """Free case drop: first click wins one free roll of the announced case."""
 
     def __init__(self, case_id, case_name, emoji, roles, weights, staff_id, channel_id):
-        super().__init__(timeout=600)
+        super().__init__(timeout=30)  # short window: a drop is a quick server event
         self.case_id = int(case_id)
         self.case_name = case_name
         self.emoji = emoji
@@ -3256,6 +3287,7 @@ class CaseDropView(discord.ui.View):
             await games_animate(roll_msg, frames, delay=0.45)
         except Exception:
             roll_msg = None
+        cosmetic_ids = set(await games_cosmetic_hierarchy())
         won = games_weighted_choice(self.roles, self.weights)
         role_granted = False
         already_owned = False
@@ -3269,7 +3301,7 @@ class CaseDropView(discord.ui.View):
                     already_owned = True
                 else:
                     try:
-                        if int(won.id) in COSMETIC_ROLE_IDS:
+                        if int(won.id) in cosmetic_ids:
                             # Cosmetic: save to the /equip list, then apply the
                             # /equip rule (highest hierarchy gets worn).
                             await async_db(set_user_cosmetic_role, member.id, int(won.id))
@@ -3321,7 +3353,7 @@ class CaseDropView(discord.ui.View):
             reveal.add_field(name="Price paid", value="**FREE** 🎉", inline=True)
             if already_owned:
                 reveal.add_field(name="Duplicate", value="Already owned — free drop, so no coin credit", inline=True)
-            elif role_granted and int(won.id) in COSMETIC_ROLE_IDS:
+            elif role_granted and int(won.id) in cosmetic_ids:
                 cosmetic_value = {
                     "equipped": "✨ Equipped! It's also in your `/equip` list.",
                     "kept": "Added to your `/equip` list — you're already wearing a higher cosmetic.",
@@ -3413,7 +3445,7 @@ async def games_spawn(interaction: discord.Interaction, action: app_commands.Cho
                 description=("🎉 **First click wins one FREE roll** of this case!\n\n" + "\n".join(lines))[:4000],
                 color=discord.Color.gold(),
             )
-            embed.set_footer(text="10:00 on the clock · first click wins · /spawn case")
+            embed.set_footer(text="⏳ expires in 0:30 · first click wins · /spawn case")
             view = CaseDropView(
                 drop_case["id"], drop_case["name"], drop_case["emoji"],
                 roles, weights, interaction.user.id, interaction.channel.id,
@@ -3453,10 +3485,12 @@ async def games_equip(interaction: discord.Interaction):
     member = interaction.user
     if not member or not isinstance(member, discord.Member):
         return await interaction.followup.send("❌ Must be used in server.", ephemeral=True)
+    hierarchy = await games_cosmetic_hierarchy()
+    cosmetic_ids = set(int(x) for x in hierarchy)
     db_owned_ids = await async_db(get_user_cosmetic_roles, member.id)
     if not db_owned_ids:
         # fallback to Discord roles
-        owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
+        owned = [r for r in member.roles if int(r.id) in cosmetic_ids]
     else:
         owned = []
         guild = interaction.guild
@@ -3469,30 +3503,44 @@ async def games_equip(interaction: discord.Interaction):
                 pass
     if not owned:
         return await interaction.followup.send("❌ You don't own any cosmetic roles. Earn them from crates first!", ephemeral=True)
-    # Use highest hierarchy from owned
-    best = None
-    best_idx = float('inf')
-    for r in owned:
+    # Highest tier first (order of the resolved hierarchy), unknown ids last.
+    owned.sort(key=lambda r: hierarchy.index(int(r.id)) if int(r.id) in hierarchy else 10000)
+    worn_ids = {int(r.id) for r in member.roles if int(r.id) in cosmetic_ids}
+
+    async def _wear(role):
+        if role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Equipped via /equip")
+            except Exception as exc:
+                print(f"[games] /equip: couldn't add role: {exc}")
+                return False
+        for r in member.roles:
+            if int(r.id) in cosmetic_ids and int(r.id) != int(role.id):
+                try:
+                    await member.remove_roles(r, reason="Replaced via /equip")
+                except Exception:
+                    pass
         try:
-            idx = COSMETIC_HIERARCHY.index(int(r.id))
-            if idx < best_idx:
-                best_idx = idx
-                best = r
-        except ValueError:
-            continue
-    if best and best not in member.roles:
-        try:
-            await member.add_roles(best, reason="Equipped via /equip")
+            await async_db(set_user_cosmetic_role, member.id, int(role.id))
         except Exception:
             pass
-    # Mark selected in DB (optional: could save best specifically; already saved)
-    try:
-        await async_db(set_user_cosmetic_role, member.id, best.id if best else (owned[0].id if owned else 0))
-    except Exception:
-        pass
-    # Build embed with current owned list
-    embed = discord.Embed(title="🎭 Equip Cosmetic", description=f"Your owned cosmetic roles (highest selected): {', '.join(r.name for r in owned[:10]) or 'None'}", color=discord.Color.blue())
-    await interaction.followup.send(embed=embed, ephemeral=True)
+        return True
+
+    if len(owned) == 1:
+        only = owned[0]
+        if not await _wear(only):
+            return await interaction.followup.send(
+                "❌ Couldn't equip that role (permissions or role order).", ephemeral=True)
+        return await interaction.followup.send(f"🎭 Now wearing **{only.name}**.", ephemeral=True)
+
+    lines = [f"🎭 **{r.name}**" + (" — *currently worn*" if int(r.id) in worn_ids else "")
+             for r in owned[:15]]
+    embed = discord.Embed(
+        title="🎭 Equip Cosmetic",
+        description="Pick a cosmetic to wear (highest tier first):\n" + "\n".join(lines),
+        color=discord.Color.blue())
+    view = EquipSelectView(member.id, [(int(r.id), r.name) for r in owned])
+    view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
 
 @bot.tree.command(name="shop", description="Buy game items with coins", guild=guild_obj)
 async def games_shop(interaction: discord.Interaction):
@@ -3693,6 +3741,7 @@ class CaseConfirmView(discord.ui.View):
         duplicate_credit = 0
         role_granted = False
         cosmetic_status = None
+        cosmetic_ids = set(await games_cosmetic_hierarchy())
         try:
             member = interaction.user
             if isinstance(member, discord.Member) and won in member.roles:
@@ -3700,7 +3749,7 @@ class CaseConfirmView(discord.ui.View):
                 duplicate_credit = max(1, self.price // 2)
                 await async_db(games_coin_adjust, member.id, duplicate_credit, "case_duplicate", meta={"case": self.case_name, "role": won.id})
             elif isinstance(member, discord.Member):
-                if int(won.id) in COSMETIC_ROLE_IDS:
+                if int(won.id) in cosmetic_ids:
                     # Cosmetic: save to the /equip list, then apply the /equip
                     # rule (highest hierarchy gets worn).
                     await async_db(set_user_cosmetic_role, member.id, int(won.id))
@@ -9585,6 +9634,9 @@ class GameStaffRoleView(discord.ui.View):
     app_commands.Choice(name="spawn channels list", value="spawn_list"),
     app_commands.Choice(name="sync pets+eggs", value="sync"),
     app_commands.Choice(name="equip sync (scan cosmetic roles)", value="equipsync"),
+    app_commands.Choice(name="equip cosmetics list (view)", value="cosmetics_view"),
+    app_commands.Choice(name="equip cosmetics set <role ids>", value="cosmetics_set"),
+    app_commands.Choice(name="equip cosmetics reset (default)", value="cosmetics_reset"),
     app_commands.Choice(name="interest rate", value="interest"),
     app_commands.Choice(name="jackpot seed", value="jackpot"),
     app_commands.Choice(name="game role", value="role"),
@@ -9819,6 +9871,54 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         except Exception:
             chans = []
         return await interaction.followup.send("Spawn channels: " + (" ".join(f"<#{c}>" for c in chans) if chans else "none set"), ephemeral=True)
+
+    if action == "cosmetics_view":
+        hierarchy = await games_cosmetic_hierarchy()
+        guild = interaction.guild
+        lines = []
+        for i, rid in enumerate(hierarchy):
+            role = guild.get_role(rid) if guild else None
+            lines.append(f"{i + 1}. {role.mention if role else 'missing role'} — `{rid}`")
+        embed = discord.Embed(
+            title="🎭 Equip-able cosmetics (case wins)",
+            description=("Case wins with these roles are added to the user's `/equip` list and "
+                         "auto-equipped (highest tier first).\n\n" + "\n".join(lines[:25])),
+            color=discord.Color.purple(),
+        )
+        embed.set_footer(text="Replace with 'equip cosmetics set <ids>' · restore defaults with 'equip cosmetics reset'")
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+
+    if action == "cosmetics_set":
+        ids = []
+        for part in re.split(r"[,\s]+", str(value or "").strip()):
+            if part.isdigit():
+                rid = int(part)
+                if rid > 0 and rid not in ids:
+                    ids.append(rid)
+        if not ids:
+            return await interaction.followup.send(
+                "❌ Provide role IDs: `cosmetics set 123456,789012` (highest tier first, comma-separated). "
+                "Get a role ID: Developer Mode → right-click the role → Copy Role ID.", ephemeral=True)
+        if len(ids) > 25:
+            ids = ids[:25]
+        ok = await async_db(db_set_setting, COSMETIC_SETTING_KEY, json.dumps(ids))
+        if not ok:
+            return await interaction.followup.send("❌ Could not save — database unavailable.", ephemeral=True)
+        guild = interaction.guild
+        lines = []
+        for rid in ids:
+            role = guild.get_role(rid) if guild else None
+            lines.append(f"• {role.mention if role else 'missing role'} — `{rid}`")
+        return await interaction.followup.send(
+            f"✅ Equip-able cosmetics updated ({len(ids)} roles, highest tier first):\n" + "\n".join(lines),
+            ephemeral=True)
+
+    if action == "cosmetics_reset":
+        ok = await async_db(db_set_setting, COSMETIC_SETTING_KEY, "")
+        if not ok:
+            return await interaction.followup.send("❌ Could not reset — database unavailable.", ephemeral=True)
+        return await interaction.followup.send(
+            "✅ Equip-able cosmetics reset to the built-in pet cosmetics.", ephemeral=True)
 
     if action == "equipsync":
         await interaction.followup.send("⏳ Running cosmetic role sync (all owned roles saved, highest auto-equipped)...", ephemeral=True)
