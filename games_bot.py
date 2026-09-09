@@ -2285,6 +2285,7 @@ ACTIVE_HANGMAN = {}           # channel_id -> hangman session
 ACTIVE_SCRAMBLE = {}          # channel_id -> scramble round
 ACTIVE_TOWER = {}             # user_id -> tower session
 ACTIVE_TOWER_TIMEOUT_TASKS = {}  # user_id -> exact per-floor deadline task
+ACTIVE_CASE_DROPS = {}           # channel_id -> live case-drop message id
 _spawn_last_channel = {}
 _spawn_last_global = {"ts": 0.0}
 
@@ -3056,44 +3057,232 @@ async def games_equip_sync(interaction: discord.Interaction):
     await record_initial_cosmetic_roles()
     await interaction.followup.send("✅ Cosmetic sync complete — highest owned role equipped for all members; DB saved.", ephemeral=True)
 
-class CaseDropClaim(discord.ui.View):
-    def __init__(self):
+def games_pick_drop_case(name=None):
+    """(case_dict | None, error | None) — resolve a drop from the enabled catalogue."""
+    with _games_interaction_cache_lock:
+        cases = [c for c in _games_case_catalog_cache if c.get("enabled")]
+    if not cases:
+        return None, "No enabled cases — create one with `/caseadmin` first."
+    if name:
+        wanted = str(name).strip().lower()
+        case = next((c for c in cases if c["name"].lower() == wanted), None)
+        if case is None:
+            return None, "That case doesn't exist or is disabled."
+        return case, None
+    return secrets.choice(cases), None
+
+
+def games_case_roll_pool(guild, case):
+    """(roles, weights, lines) for rolling `case` here, or None when unrollable.
+
+    Same role filters and nothing-filler as the paid /case flow, so a drop can
+    never award a deleted, managed or elevated-permission role.
+    """
+    roles, weights, lines = [], [], []
+    total = 0.0
+    for role_id, chance in case.get("contents") or []:
+        role = guild.get_role(int(role_id)) if guild else None
+        if role is None or role.managed:
+            continue
+        if role.permissions.administrator or role.permissions.manage_guild or role.permissions.manage_roles:
+            continue
+        roles.append(role)
+        weights.append(float(chance))
+        total += float(chance)
+        rarity = "\u2728" if float(chance) <= 5 else ("\U0001f49c" if float(chance) <= 15 else "\U0001f4e6")
+        lines.append(f"{rarity} {role.mention} \u2014 **{float(chance):g}%** `{games_bar(float(chance), 100, 8)}`")
+    if not roles:
+        return None
+    if total > 100.0001:
+        return None
+    filler = max(0.0, 100.0 - total)
+    if filler > 0:
+        roles.append(None)
+        weights.append(filler)
+        lines.append(f"\u2b1c Nothing \u2014 **{filler:g}%** `{games_bar(filler, 100, 8)}`")
+    return roles, weights, lines
+
+
+class CaseDropView(discord.ui.View):
+    """Free case drop: first click wins one free roll of the announced case."""
+
+    def __init__(self, case_id, case_name, emoji, roles, weights, staff_id, channel_id):
         super().__init__(timeout=600)
-    @discord.ui.button(label="Claim Free Case 🎁", style=discord.ButtonStyle.green)
+        self.case_id = int(case_id)
+        self.case_name = case_name
+        self.emoji = emoji
+        self.roles = roles
+        self.weights = weights
+        self.staff_id = int(staff_id)
+        self.channel_id = int(channel_id)
+        self.claimed = False
+        self.cancelled = False
+        self.message = None
+
+    def _disable_all(self):
+        for child in self.children:
+            child.disabled = True
+
+    async def _retire(self, note):
+        self._disable_all()
+        ACTIVE_CASE_DROPS.pop(self.channel_id, None)
+        if self.message is not None:
+            try:
+                await self.message.edit(content=note, view=self)
+            except Exception:
+                pass
+
+    async def on_timeout(self):
+        if self.claimed or self.cancelled:
+            return
+        await self._retire("⌛ Drop expired — no one claimed it.")
+
+    @discord.ui.button(label="Claim Free Case", style=discord.ButtonStyle.success, emoji="🎁", row=0)
     async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.claimed or self.cancelled:
+            state = "cancelled" if self.cancelled else "already claimed"
+            return await interaction.response.send_message(f"❌ This drop was {state}.", ephemeral=True)
+        self.claimed = True  # claim before the first await: near-simultaneous clicks can't both win
         await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send("🍀 You claimed a free case! Head to /shop to open it!", ephemeral=False)
-        button.disabled = True
+        self._disable_all()
         try:
-            # Update display to show disabled button (ignore if edit fails)
-            await interaction.message.edit(view=self)
+            await self.message.edit(content=f"🎲 {interaction.user.mention} claimed the drop — rolling…", view=self)
         except Exception:
             pass
+        try:
+            # Public channel message (not a followup): the roll + reveal are a
+            # server-wide event, and the first followup of a deferred
+            # interaction would be forced ephemeral by Discord.
+            roll_msg = await interaction.channel.send("🎲 **Rolling…**")
+            cycle = [r for r in self.roles if r is not None]
+            frames = []
+            for _ in range(4):
+                pick = secrets.choice(cycle) if cycle else None
+                frames.append(f"🎁 **{pick.mention if pick else '…'}**…")
+            await games_animate(roll_msg, frames, delay=0.45)
+        except Exception:
+            roll_msg = None
+        won = games_weighted_choice(self.roles, self.weights)
+        role_granted = False
+        already_owned = False
+        won_id = None
+        if won is not None:
+            won_id = int(won.id)
+            member = interaction.user
+            if isinstance(member, discord.Member):
+                if won in member.roles:
+                    already_owned = True
+                else:
+                    try:
+                        if int(won.id) in COSMETIC_ROLE_IDS:
+                            # Cosmetic: save to the owned list, /equip wears it.
+                            await async_db(set_user_cosmetic_role(member.id, int(won.id)))
+                            role_granted = True
+                        else:
+                            await member.add_roles(won, reason=f"Free drop — case '{self.case_name}'")
+                            role_granted = True
+                    except Exception as exc:
+                        print(f"[games] drop role grant failed: {exc}")
+        # Audit + stats: never block the reveal on these; nothing was paid, so
+        # there is nothing to refund either.
+        try:
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO mcwv_case_rolls (case_id, user_id, won_role_id, price_paid) VALUES (%s,%s,%s,0)",
+                            (self.case_id, interaction.user.id, won_id),
+                        )
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            await async_db(_db_step)
+        except Exception as exc:
+            print(f"[games] drop roll audit failed: {exc}")
+        await async_db(games_track("case", interaction.channel_id, burned=0))
+        await async_db(games_track_user("case", interaction.user.id, win=role_granted))
+        if won is None:
+            reveal = discord.Embed(
+                title=f"{self.emoji} {self.case_name} — Free Drop",
+                description=f"{interaction.user.mention} won the drop… and **nothing** fell out. 😔",
+                color=games_color("slate"),
+            )
+            reveal.add_field(name="Price paid", value="**FREE** 🎉", inline=True)
+        else:
+            chance = float(self.weights[self.roles.index(won)])
+            is_rare = chance <= 5
+            reveal = discord.Embed(
+                title=f"{self.emoji} {self.case_name} — {'✨ RARE DROP!' if is_rare else '🎉 Free Drop Won!'}",
+                description=f"{interaction.user.mention} unboxed **{won.mention}** for free!",
+                color=games_color("amber") if is_rare else games_color("green"),
+            )
+            reveal.add_field(name="Roll odds", value=f"**{chance:g}%**", inline=True)
+            reveal.add_field(name="Price paid", value="**FREE** 🎉", inline=True)
+            if already_owned:
+                reveal.add_field(name="Duplicate", value="Already owned — free drop, so no coin credit", inline=True)
+            elif role_granted and int(won.id) in COSMETIC_ROLE_IDS:
+                reveal.add_field(name="Cosmetic", value="Saved to your list — run `/equip` to wear it!", inline=True)
+        reveal.set_footer(text="Free staff drop · /spawn case")
+        try:
+            if roll_msg is not None:
+                await roll_msg.edit(content=None, embed=reveal)
+            else:
+                await interaction.channel.send(embed=reveal)
+        except Exception:
+            try:
+                await interaction.channel.send(embed=reveal)
+            except Exception:
+                pass
+        await self._retire(f"🏆 Claimed by {interaction.user.mention}!")
+
+    @discord.ui.button(label="Cancel Drop", style=discord.ButtonStyle.danger, emoji="🚫", row=0)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.staff_id:
+            return await interaction.response.send_message(
+                "❌ Only the staff member who started the drop can cancel it.", ephemeral=True)
+        if self.claimed:
+            return await interaction.response.send_message("❌ Someone already claimed this drop.", ephemeral=True)
+        if self.cancelled:
+            return await interaction.response.send_message("❌ This drop is already cancelled.", ephemeral=True)
+        self.cancelled = True
+        await interaction.response.defer(ephemeral=True)
+        await self._retire("🚫 Drop cancelled by staff.")
 
 
-@bot.tree.command(name="spawn", description="Staff: spawn game round (guess/case/pets) with 5m cooldown", guild=guild_obj)
-@app_commands.describe(action="What to spawn: guess | case | pets")
+async def _case_drop_autocomplete(interaction: discord.Interaction, current: str):
+    # Forwarder: games_case_autocomplete is defined later in the module, but
+    # the /spawn decorators are evaluated at definition time.
+    return await games_case_autocomplete(interaction, current)
+
+
+@bot.tree.command(name="spawn", description="Staff: spawn a rewarded guess round, a free case drop, or a pet/egg sync", guild=guild_obj)
+@app_commands.describe(
+    action="What to spawn: guess | case | pets",
+    case="Which case to drop (default: a random enabled case)",
+)
 @app_commands.choices(action=[
-    app_commands.Choice(name="Guess round", value="guess"),
-    app_commands.Choice(name="Case event", value="case"),
+    app_commands.Choice(name="Guess round (rewarded)", value="guess"),
+    app_commands.Choice(name="Free case drop", value="case"),
     app_commands.Choice(name="Pet/egg sync", value="pets"),
 ])
-async def games_spawn(interaction: discord.Interaction, action: app_commands.Choice[str]):
+@app_commands.autocomplete(case=_case_drop_autocomplete)
+async def games_spawn(interaction: discord.Interaction, action: app_commands.Choice[str], case: str = None):
     await interaction.response.defer(ephemeral=True)
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("❌ Games not enabled.", ephemeral=True)
     staff_ids = games_staff_role_ids()
     if not staff_ids or not any(role.id in staff_ids for role in interaction.user.roles):
         return await interaction.followup.send("❌ Game Staff role required.", ephemeral=True)
-    # No per-user cooldown; allow spawning if no active event running (simple global check)
-    # If you want to prevent overlap, check if any event is active
-    pass
     try:
         if action.value == "guess":
             if interaction.channel.id in ACTIVE_GUESS_ROUNDS or interaction.channel.id in ACTIVE_GUESS_STARTING:
                 return await interaction.followup.send(
                     "❌ A Guess the Pet round is already active or loading in this channel.", ephemeral=True)
-            started = await games_start_guess_round(interaction.channel, rewarded=False, source="staff_spawn")
+            started = await games_start_guess_round(interaction.channel, rewarded=True, source="staff_spawn")
             if isinstance(started, str):
                 return await interaction.followup.send(started, ephemeral=True)
             if started is False:
@@ -3102,14 +3291,45 @@ async def games_spawn(interaction: discord.Interaction, action: app_commands.Cho
                 return await interaction.followup.send(
                     "❌ Could not start the round — no usable pet data available.", ephemeral=True)
             return await interaction.followup.send(
-                f"🎮 Guess round started — **{started['pet_name']}** is in <#{interaction.channel.id}>!",
+                f"🎮 **Rewarded** guess round started — **{started['pet_name']}** is in <#{interaction.channel.id}>!",
                 ephemeral=True)
         elif action.value == "case":
-                await interaction.followup.send(
-                    embed=discord.Embed(title="🎁 Staff Case Drop!", description="First click claims a free case — only 1 allowed.", color=discord.Color.gold()),
-                    view=CaseDropClaim(),
-                    ephemeral=False
-                )
+            drop_case, err = games_pick_drop_case(case)
+            if drop_case is None:
+                return await interaction.followup.send(f"❌ {err}", ephemeral=True)
+            pool = games_case_roll_pool(interaction.guild, drop_case)
+            if pool is None:
+                return await interaction.followup.send(
+                    f"❌ **{drop_case['name']}** can't be dropped — check its contents in `/caseadmin` "
+                    f"(usable roles, total odds ≤ 100%).", ephemeral=True)
+            roles, weights, lines = pool
+            if interaction.channel.id in ACTIVE_CASE_DROPS:
+                return await interaction.followup.send(
+                    "❌ A case drop is already live in this channel — wait for it to expire or cancel it first.",
+                    ephemeral=True)
+            embed = discord.Embed(
+                title=f"{drop_case['emoji']} {drop_case['name']} — FREE CASE DROP!",
+                description=("🎉 **First click wins one FREE roll** of this case!\n\n" + "\n".join(lines))[:4000],
+                color=discord.Color.gold(),
+            )
+            embed.set_footer(text="10:00 on the clock · first click wins · /spawn case")
+            view = CaseDropView(
+                drop_case["id"], drop_case["name"], drop_case["emoji"],
+                roles, weights, interaction.user.id, interaction.channel.id,
+            )
+            ACTIVE_CASE_DROPS[interaction.channel.id] = True  # reserve before any await
+            try:
+                # A normal channel message, not the command's response: Discord
+                # makes the first followup of a deferred interaction inherit the
+                # defer's ephemeral state, so a followup "drop" would be
+                # invisible to everyone but the staff member.
+                view.message = await interaction.channel.send(embed=embed, view=view)
+            except Exception:
+                ACTIVE_CASE_DROPS.pop(interaction.channel.id, None)
+                raise
+            ACTIVE_CASE_DROPS[interaction.channel.id] = view.message
+            await interaction.followup.send(
+                f"✅ **{drop_case['name']}** drop is live — first click wins!", ephemeral=True)
         elif action.value == "pets":
             await interaction.followup.send("🔄 Pet/egg sync started...", ephemeral=True)
             await asyncio.to_thread(games_sync_pets_from_web)
@@ -4361,7 +4581,7 @@ async def games_guess(interaction: discord.Interaction, action: str, mode: str =
                 ),
                 inline=False,
             )
-        games_footer(embed, "Rewarded rounds spawn automatically · staff-started rounds are practice")
+        games_footer(embed, "Rewarded rounds spawn automatically and via /spawn · manual /guess starts are practice")
         return await interaction.followup.send(embed=embed, ephemeral=True)
 
     if not games_staff_check(interaction.user):
