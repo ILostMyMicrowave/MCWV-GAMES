@@ -91,6 +91,31 @@ DB_WORKER_CONNECTION_OPTIONS = (
 )
 _database_initializing = True
 
+# ---------------------------------------------------------------------------
+# async_db — the ONLY way async (event-loop) code may touch the shared `conn`.
+#
+# The shared connection must stay single-threaded: running two queries on it
+# at once interleaves their transactions (see games_new_db_connection).
+# `_shared_conn_lock` guarantees the same serialisation the event loop used to
+# provide for free, while `asyncio.to_thread` moves the blocking I/O to a
+# worker thread so the rest of the bot keeps responding.
+#
+# Rule: any blocking DB work reached from an async context — a helper call or
+# an inline `with conn` block — goes through `await async_db(...)`. Housekeeping
+# jobs that need long statements keep using `games_new_db_connection()` worker
+# connections instead (they never touch the shared conn).
+_shared_conn_lock = threading.RLock()
+
+
+def _run_serialized_db(fn, *args, **kwargs):
+    with _shared_conn_lock:
+        return fn(*args, **kwargs)
+
+
+async def async_db(fn, *args, **kwargs):
+    """Run blocking DB helper `fn` off the event loop (serialised on `conn`)."""
+    return await asyncio.to_thread(_run_serialized_db, fn, *args, **kwargs)
+
 # Database-backed settings are read frequently by gates and component checks.
 # A short cache removes PostgreSQL I/O from the acknowledgement path.
 _DB_SETTING_CACHE_TTL = max(5.0, float(os.environ.get("DB_SETTING_CACHE_TTL", "30")))
@@ -181,6 +206,15 @@ def init_base_schema():
                 value TEXT NOT NULL
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS mcwv_active_sessions (
+                session_key TEXT PRIMARY KEY,
+                game TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS mcwv_active_sessions_updated_idx ON mcwv_active_sessions (updated_at)")
 
 
 def _db_refresh_setting_sync(cache_key, default):
@@ -928,10 +962,17 @@ def games_shop_embed(user_id, page=0):
 
 async def games_hub_embed(user):
     """The /games hub card (also reused by quick views)."""
-    bal = games_coin_balance(user.id)
-    featured_slug = games_featured_egg()
-    featured = next((e for e in games_get_eggs() if e["slug"] == featured_slug), None)
-    daily_state = "✅ claimed" if await games_daily_claimed(user.id) else "⚠️ not yet — run `/daily`"
+    bal = await async_db(games_coin_balance(user.id))
+    featured_slug = await async_db(games_featured_egg())
+    _dbv1_933 = await async_db(games_get_eggs())
+    featured = next((e for e in _dbv1_933 if e["slug"] == featured_slug), None)
+    _claimed = await games_daily_claimed(user.id)
+    if _claimed is None:
+        daily_state = "❓ unknown — DB check failed, try `/daily`"
+    elif _claimed:
+        daily_state = "✅ claimed"
+    else:
+        daily_state = "⚠️ not yet — run `/daily`"
     embed = discord.Embed(
         title="🎮 MCWV Games Hub",
         description=(
@@ -953,7 +994,8 @@ async def games_hub_embed(user):
     embed.add_field(name="🎡 Spins today", value=spins_txt, inline=True)
     scratch_used, _, _scratch_reset = games_free_status(user.id, "scratch")
     tower_used, _, tower_reset = games_free_status(user.id, "tower")
-    petdle_state = "✅ solved" if games_petdle_solved_today(user.id) else "`/petdle`"
+    _dbv1_962 = await async_db(games_petdle_solved_today(user.id))
+    petdle_state = "✅ solved" if _dbv1_962 else "`/petdle`"
     embed.add_field(name="🐾 Petdle today", value=petdle_state, inline=True)
     embed.add_field(name="🎴 Scratch today", value=f"`{scratch_used}/1` free", inline=True)
     tower_txt = f"`{tower_used}/{GAMES_TOWER_RUNS_PER_DAY}` runs"
@@ -965,9 +1007,10 @@ async def games_hub_embed(user):
         value=f"**{featured['name']}** — top-tier odds doubled!" if featured else "—",
         inline=False,
     )
+    _dbv1_976 = await async_db(games_jackpot_get())
     embed.add_field(
         name="🎰 Progressive jackpot",
-        value=f"**{games_jackpot_get():,}** 🪙 — hit it on `/spin`!",
+        value=f"**{_dbv1_976:,}** 🪙 — hit it on `/spin`!",
         inline=False,
     )
     embed.add_field(
@@ -990,16 +1033,22 @@ async def games_hub_embed(user):
 
 
 async def games_daily_claimed(user_id):
-    """True when the user already claimed their daily in the last 24h."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT last_daily_at FROM mcwv_coins WHERE discord_id = %s AND last_daily_at > NOW() - INTERVAL '24 hours'",
-                (int(user_id),),
-            )
-            return cur.fetchone() is not None
-    except Exception:
-        return False
+    """True/False when known; None when the DB check failed (fail-closed).
+
+    Callers must treat None as 'unknown' — never as 'not claimed' (a transient
+    DB error must not open a window to claim a second daily).
+    """
+    def _check():
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT last_daily_at FROM mcwv_coins WHERE discord_id = %s AND last_daily_at > NOW() - INTERVAL '24 hours'",
+                    (int(user_id),),
+                )
+                return cur.fetchone() is not None
+        except Exception:
+            return None
+    return await async_db(_check)
 
 
 def games_petdle_solved_today(user_id):
@@ -1021,12 +1070,22 @@ async def games_top_embed(user_id, games=None):
     if games:
         if games == "tower":
             try:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT discord_id, best_floor, best_score, runs FROM mcwv_tower_scores
-                        ORDER BY best_floor DESC, best_score DESC LIMIT 10
-                    """)
-                    tower_rows = cur.fetchall()
+                def _db_step():
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                SELECT discord_id, best_floor, best_score, runs FROM mcwv_tower_scores
+                                ORDER BY best_floor DESC, best_score DESC LIMIT 10
+                            """)
+                            tower_rows = cur.fetchall()
+                        return tower_rows
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        raise
+                tower_rows = await async_db(_db_step)
             except Exception:
                 tower_rows = []
             lines = [
@@ -1041,13 +1100,23 @@ async def games_top_embed(user_id, games=None):
             games_footer(embed, "Ranked by best floor, then best score")
             return embed
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT discord_id, wins, plays FROM mcwv_user_stats
-                    WHERE game = %s
-                    ORDER BY wins DESC, plays DESC LIMIT 10
-                """, (games,))
-                rows = cur.fetchall()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT discord_id, wins, plays FROM mcwv_user_stats
+                            WHERE game = %s
+                            ORDER BY wins DESC, plays DESC LIMIT 10
+                        """, (games,))
+                        rows = cur.fetchall()
+                    return rows
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            rows = await async_db(_db_step)
         except Exception as exc:
             print(f"[games] top games fetch failed: {exc}")
             rows = []
@@ -1071,9 +1140,19 @@ async def games_top_embed(user_id, games=None):
         embed.set_footer(text=f"Your {games} wins: {my_wins}")
         return embed
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT discord_id, balance, bank FROM mcwv_coins WHERE balance + bank > 0 ORDER BY balance + bank DESC LIMIT 10")
-            rows = cur.fetchall()
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT discord_id, balance, bank FROM mcwv_coins WHERE balance + bank > 0 ORDER BY balance + bank DESC LIMIT 10")
+                    rows = cur.fetchall()
+                return rows
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        rows = await async_db(_db_step)
     except Exception as exc:
         print(f"[games] top fetch failed: {exc}")
         rows = []
@@ -1092,7 +1171,7 @@ async def games_top_embed(user_id, games=None):
         description="\n".join(lines),
         color=games_color("gold"),
     )
-    rank = games_coin_rank(user_id)
+    rank = await async_db(games_coin_rank(user_id))
     if rank:
         embed.set_footer(text=f"Your rank: #{rank} · /daily, games, duels and bank interest all pay")
     return embed
@@ -1180,7 +1259,7 @@ async def record_initial_cosmetic_roles():
     """Scan all members: equip only highest owned cosmetic, save to DB, remove others."""
     if not db_enabled() or not conn:
         return
-    _ensure_cosmetic_table()
+    await async_db(_ensure_cosmetic_table())
     try:
         guild = bot.get_guild(GUILD_ID)
         if not guild:
@@ -1194,7 +1273,7 @@ async def record_initial_cosmetic_roles():
             # Save ALL currently owned cosmetic roles to DB
             for r in owned:
                 try:
-                    set_user_cosmetic_role(member.id, r.id)
+                    await async_db(set_user_cosmetic_role(member.id, r.id))
                 except Exception:
                     pass
             # Auto-equip only highest hierarchy
@@ -1212,7 +1291,7 @@ async def record_initial_cosmetic_roles():
                     except Exception:
                         pass
                 # Ensure DB reflects equipped (highest) too
-                set_user_cosmetic_role(member.id, best.id)
+                await async_db(set_user_cosmetic_role(member.id, best.id))
     except Exception as e:
         print(f"[cosmetic_initial] error: {e}")
 
@@ -1356,6 +1435,210 @@ def games_gate_message(user_id):
     if db_is_owner_discord(user_id):
         return True
     return games_is_tester(user_id)
+
+
+# ---------- ACTIVE SESSION PERSISTENCE (restart recovery) ----------
+# Chat-based games (guess / scramble / hangman / tower) keep their round state
+# in memory. On a Render sleep or deploy that state used to vanish with the
+# answer unrevealed and tower progress lost. Each live round is therefore
+# mirrored into mcwv_active_sessions: written on start and on tower floor
+# progress, marked `ended` when the round finishes, and settled at startup by
+# games_recover_sessions(). A 35-minute hygiene sweep in the housekeeping loop
+# keeps the table small even if an end-mark is ever missed.
+def games_session_save(key, game, payload):
+    """Mirror an in-progress session into the DB (best effort)."""
+    try:
+        if not db_enabled():
+            return False
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO mcwv_active_sessions (session_key, game, payload, updated_at)
+                       VALUES (%s, %s, %s::jsonb, NOW())
+                       ON CONFLICT (session_key) DO UPDATE
+                           SET payload = EXCLUDED.payload, updated_at = NOW()""",
+                    (str(key), str(game), json.dumps(payload, default=list)),
+                )
+        return True
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[games] session save failed ({key}): {exc}")
+        return False
+
+
+def games_session_end(key):
+    """Mark a finished session so a restart never double-reveals it."""
+    try:
+        if not db_enabled():
+            return False
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE mcwv_active_sessions "
+                    "SET payload = jsonb_set(payload, '{ended}', 'true'), updated_at = NOW() "
+                    "WHERE session_key = %s",
+                    (str(key),),
+                )
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def games_session_delete(key):
+    try:
+        if not db_enabled():
+            return False
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM mcwv_active_sessions WHERE session_key = %s", (str(key),))
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def games_session_load():
+    """[(session_key, game, payload_dict), ...] for every session row."""
+    try:
+        if not db_enabled():
+            return []
+        with conn.cursor() as cur:
+            cur.execute("SELECT session_key, game, payload FROM mcwv_active_sessions")
+            rows = cur.fetchall()
+        out = []
+        for key, game, payload in rows:
+            try:
+                data = payload if isinstance(payload, dict) else json.loads(payload or "{}")
+            except Exception:
+                data = {}
+            out.append((key, game, data))
+        return out
+    except Exception as exc:
+        print(f"[games] session load failed: {exc}")
+        return []
+
+
+async def _reveal_round_answer(kind, data):
+    """Post the missed reveal after a restart, best effort."""
+    try:
+        channel = await bot.fetch_channel(int(data.get("channel_id", 0)))
+    except Exception:
+        channel = None
+    if channel is None:
+        return
+    answer = data.get("pet_name") or data.get("answer") or data.get("word") or "?"
+    titles = {"guess": "⌛ Round restarted — nobody got it",
+              "scramble": "⏰ Scramble Over (bot restarted)",
+              "hangman": "⏰ Hangman Expired (bot restarted)"}
+    try:
+        e = discord.Embed(title=titles.get(kind, "⏰ Round Over"),
+                          description=f"The answer was **{answer}**.",
+                          color=games_color("slate"))
+        await channel.send(embed=e)
+        print(f"[games] revealed missed {kind} answer '{answer}' in {data.get('channel_id')}")
+    except Exception as exc:
+        print(f"[games] missed-reveal send failed: {exc}")
+
+
+async def games_recover_sessions():
+    """Settle in-progress chat games after a process restart.
+
+    guess/scramble/hangman: still inside their timeout -> restore the round
+    in memory (and re-arm the exact guess clock); past it -> reveal the
+    answer. tower: floor deadline passed -> settle the timeout the same way
+    the live clock does; question not yet posted (kind None) -> ask the floor
+    again; otherwise the run simply continues (answers are stored in the
+    payload). Rows already marked `ended` (or unparsable) are removed.
+    """
+    rows = await async_db(games_session_load)
+    if not rows:
+        return
+    now = time.time()
+    for key, game, data in rows:
+        try:
+            if not data or data.get("ended"):
+                await async_db(games_session_delete, key)
+                continue
+            started = float(data.get("started", 0) or 0)
+            if game == "guess":
+                if started and now - started < GAMES_GUESS_TIMEOUT:
+                    channel_id = int(data["channel_id"])
+                    ACTIVE_GUESS_ROUNDS[channel_id] = {
+                        "channel_id": channel_id,
+                        "started": started,
+                        "pet_name": data.get("pet_name"),
+                        "mode": data.get("mode"),
+                        "rewarded": data.get("rewarded", True),
+                        "participants": set(data.get("participants", [])),
+                        "attempts": {},
+                        "message_id": data.get("message_id"),
+                    }
+                    clock = asyncio.create_task(games_guess_clock(channel_id, started))
+                    ACTIVE_GUESS_TASKS[channel_id] = clock
+                    print(f"[games] restored guess round in channel {channel_id}")
+                else:
+                    await _reveal_round_answer("guess", data)
+                    await async_db(games_session_delete, key)
+            elif game == "scramble":
+                if started and now - started < GAMES_ROUND_TIMEOUT:
+                    ACTIVE_SCRAMBLE[int(data["channel_id"])] = {
+                        "answer": data.get("answer", "?"),
+                        "started": started,
+                        "attempts": {},
+                        "participants": set(data.get("participants", [])),
+                    }
+                    print(f"[games] restored scramble round in channel {data.get('channel_id')}")
+                else:
+                    await _reveal_round_answer("scramble", data)
+                    await async_db(games_session_delete, key)
+            elif game == "hangman":
+                if started and now - started < 300:
+                    ACTIVE_HANGMAN[int(data["channel_id"])] = {
+                        "word": data.get("word", "?"),
+                        "core": data.get("core", ""),
+                        "guessed": set(),
+                        "wrong": 0,
+                        "started": started,
+                        "full_guesses": {},
+                        "participants": set(data.get("participants", [])),
+                    }
+                    print(f"[games] restored hangman round in channel {data.get('channel_id')}")
+                else:
+                    await _reveal_round_answer("hangman", data)
+                    await async_db(games_session_delete, key)
+            elif game == "tower":
+                uid = int(data["user_id"])
+                session = dict(data)
+                session["active"] = True
+                floor_started = float(data.get("floor_started", started) or 0)
+                ACTIVE_TOWER[uid] = session
+                if not session.get("kind"):
+                    # Restarted between floors: the floor question was never
+                    # (re)posted, so ask a fresh floor for the stored floor.
+                    channel = bot.get_channel(int(session.get("channel_id", 0)))
+                    if channel is not None:
+                        await games_tower_ask_chat(channel, uid)
+                    else:
+                        session["active"] = False
+                        await async_db(games_session_end, f"tower:{uid}")
+                elif now > floor_started + GAMES_TOWER_FLOOR_TIMEOUT:
+                    # Settle the stale floor the same way the live timeout does
+                    # (one heart penalty, then next floor or run over).
+                    await games_tower_timeout(uid, session)
+                else:
+                    print(f"[games] restored tower run for <@{uid}> (floor {data.get('floor')}, score {data.get('score')})")
+        except Exception as exc:
+            print(f"[games] session recovery failed for {key}: {exc}")
 
 
 def games_new_db_connection():
@@ -2245,38 +2528,58 @@ async def games_daily(interaction: discord.Interaction):
     uid = interaction.user.id
     now = datetime.now(timezone.utc)
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO mcwv_coins (discord_id) VALUES (%s) ON CONFLICT (discord_id) DO NOTHING", (uid,))
-            # ATOMIC claim: single guarded UPDATE — concurrent/rapid claims can
-            # never both pass the 24h guard (old check-then-update could).
-            cur.execute(
-                """
-                UPDATE mcwv_coins
-                SET daily_streak = CASE
-                        WHEN last_daily_at IS NULL OR last_daily_at < NOW() - INTERVAL '48 hours'
-                        THEN 1 ELSE daily_streak + 1 END,
-                    last_daily_at = NOW(),
-                    balance = balance + %(base)s + %(bonus)s * (
-                        CASE WHEN last_daily_at IS NULL OR last_daily_at < NOW() - INTERVAL '48 hours'
-                        THEN 0 ELSE LEAST(daily_streak, %(cap_index)s) END),
-                    total_earned = total_earned + %(base)s + %(bonus)s * (
-                        CASE WHEN last_daily_at IS NULL OR last_daily_at < NOW() - INTERVAL '48 hours'
-                        THEN 0 ELSE LEAST(daily_streak, %(cap_index)s) END)
-                WHERE discord_id = %(uid)s
-                  AND (last_daily_at IS NULL OR last_daily_at < NOW() - INTERVAL '24 hours')
-                RETURNING daily_streak, balance
-                """,
-                {"uid": uid, "base": GAMES_DAILY_BASE, "bonus": GAMES_DAILY_STREAK_BONUS,
-                 "cap_index": GAMES_DAILY_STREAK_REWARD_CAP - 1},
-            )
-            row = cur.fetchone()
-        conn.commit()
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO mcwv_coins (discord_id) VALUES (%s) ON CONFLICT (discord_id) DO NOTHING", (uid,))
+                    # ATOMIC claim: single guarded UPDATE — concurrent/rapid claims can
+                    # never both pass the 24h guard (old check-then-update could).
+                    cur.execute(
+                        """
+                        UPDATE mcwv_coins
+                        SET daily_streak = CASE
+                                WHEN last_daily_at IS NULL OR last_daily_at < NOW() - INTERVAL '48 hours'
+                                THEN 1 ELSE daily_streak + 1 END,
+                            last_daily_at = NOW(),
+                            balance = balance + %(base)s + %(bonus)s * (
+                                CASE WHEN last_daily_at IS NULL OR last_daily_at < NOW() - INTERVAL '48 hours'
+                                THEN 0 ELSE LEAST(daily_streak, %(cap_index)s) END),
+                            total_earned = total_earned + %(base)s + %(bonus)s * (
+                                CASE WHEN last_daily_at IS NULL OR last_daily_at < NOW() - INTERVAL '48 hours'
+                                THEN 0 ELSE LEAST(daily_streak, %(cap_index)s) END)
+                        WHERE discord_id = %(uid)s
+                          AND (last_daily_at IS NULL OR last_daily_at < NOW() - INTERVAL '24 hours')
+                        RETURNING daily_streak, balance
+                        """,
+                        {"uid": uid, "base": GAMES_DAILY_BASE, "bonus": GAMES_DAILY_STREAK_BONUS,
+                         "cap_index": GAMES_DAILY_STREAK_REWARD_CAP - 1},
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+                return row
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        row = await async_db(_db_step)
         if row is None:
-            with conn.cursor() as cur:
-                cur.execute("SELECT last_daily_at FROM mcwv_coins WHERE discord_id = %s", (uid,))
-                last_row = cur.fetchone()
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT last_daily_at FROM mcwv_coins WHERE discord_id = %s", (uid,))
+                        last_row = cur.fetchone()
+                    conn.commit()
+                    return last_row
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            last_row = await async_db(_db_step)
             if last_row and last_row[0]:
                 nxt = last_row[0] + timedelta(hours=24)
                 return await interaction.followup.send(
@@ -2286,16 +2589,25 @@ async def games_daily(interaction: discord.Interaction):
         award = GAMES_DAILY_BASE + GAMES_DAILY_STREAK_BONUS * min(streak - 1, GAMES_DAILY_STREAK_REWARD_CAP - 1)
         new_balance = int(row[1] or 0)
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta) "
-                    "VALUES (%s,%s,'daily',%s,%s,%s::jsonb)",
-                    (uid, uid, award, new_balance, json.dumps({"streak": streak})),
-                )
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta) "
+                            "VALUES (%s,%s,'daily',%s,%s,%s::jsonb)",
+                            (uid, uid, award, new_balance, json.dumps({"streak": streak})),
+                        )
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            await async_db(_db_step)
         except Exception as log_exc:
             print(f"[games] daily log failed: {log_exc}")
-        games_track("daily", interaction.channel_id, minted=award)
+        await async_db(games_track("daily", interaction.channel_id, minted=award))
         flames = "\U0001f525" * min(streak, 10)
         bar_filled = games_bar(min(streak, 10), 10)
         milestone = {7: " 🎖 1 week!", 14: " 🏅 2 weeks!", 30: " 👑 30 days!", 100: " 💎 100 days!"}.get(streak, "")
@@ -2321,10 +2633,6 @@ async def games_daily(interaction: discord.Interaction):
         games_footer(embed, f"Streak resets after 48h · reward caps at day {GAMES_DAILY_STREAK_REWARD_CAP}")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         print(f"[games] daily failed: {exc}")
         await interaction.followup.send("❌ Something went wrong claiming your daily.", ephemeral=True)
 
@@ -2361,11 +2669,21 @@ class EquipSelectView(discord.ui.View):
             # Only one global claim allowed; check DB first (simple guard)
             db_claim_done = False
             try:
-                _ensure_case_claim_table()
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1 FROM user_case_claim WHERE discord_id = %s", (interaction.user.id,))
-                    if cur.fetchone():
-                        db_claim_done = True
+                await async_db(_ensure_case_claim_table())
+                def _db_step():
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT 1 FROM user_case_claim WHERE discord_id = %s", (interaction.user.id,))
+                            if cur.fetchone():
+                                db_claim_done = True
+                        return db_claim_done
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        raise
+                db_claim_done = await async_db(_db_step)
             except Exception:
                 pass
             if db_claim_done:
@@ -2398,7 +2716,15 @@ class EquipSelectView(discord.ui.View):
                     await self.member.add_roles(role, reason="Equipped via /equip dropdown")
                 except Exception as exc:
                     return await interaction.followup.send(f"❌ Could not add role: {exc}", ephemeral=True)
-            ok = set_user_cosmetic_role(self.member.id, role.id)
+            _dbv1_2409 = await async_db(set_user_cosmetic_role(self.member.id, role.id))
+            if not _dbv1_2409:
+                # Role was granted on Discord; the DB mark failed. Tell the user
+                # rather than swallowing it (the /equip dropdown would re-offer
+                # stale state otherwise).
+                return await interaction.followup.send(
+                    f"⚠️ {role.name} equipped, but I couldn't save your selection — try again in a moment.",
+                    ephemeral=True,
+                )
             removed_text = (" Removed others: " + ", ".join(removed) + ".") if removed else ""
             embed = discord.Embed(title="✅ Equipped: {role.name}", description=f"You equipped **{role.name}** — only 1 cosmetic role allowed at a time.\nLast equipped: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} Zone.\n{removed_text}\n\nTip: Earn more from crates, then use `/equip` again.", color=discord.Color.green())
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -2431,7 +2757,7 @@ async def games_pay(interaction: discord.Interaction, user: discord.User, amount
         return await interaction.followup.send("❌ You can't pay yourself!", ephemeral=True)
     if getattr(user, "bot", False):
         return await interaction.followup.send("❌ Bots can't receive game coins.", ephemeral=True)
-    ok, res = games_coin_transfer(interaction.user.id, user.id, amount)
+    ok, res = await async_db(games_coin_transfer(interaction.user.id, user.id, amount))
     if not ok:
         return await interaction.followup.send(f"❌ {res}", ephemeral=True)
     embed = discord.Embed(title=f"{games_emoji('pay', '💸')} Payment Sent", description=f"{games_money(amount)} → {getattr(user, 'mention', '<@%s>' % user.id)}", color=games_color("green"))
@@ -2446,14 +2772,14 @@ async def games_deposit(interaction: discord.Interaction, amount: str):
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     uid = interaction.user.id
-    bal = games_coin_balance(uid)
+    bal = await async_db(games_coin_balance(uid))
     try:
         amt = bal["balance"] if str(amount).strip().lower() == "all" else int(amount)
     except (ValueError, TypeError):
         return await interaction.followup.send("❌ Amount must be a whole number or `all`.", ephemeral=True)
     if amt <= 0 or amt > GAMES_MAX_TRANSACTION:
         return await interaction.followup.send(f"❌ Amount must be between 1 and {GAMES_MAX_TRANSACTION:,}.", ephemeral=True)
-    ok, result = games_bank_move(uid, amt, "deposit")
+    ok, result = await async_db(games_bank_move(uid, amt, "deposit"))
     if not ok:
         return await interaction.followup.send(f"❌ {result}", ephemeral=True)
     embed = discord.Embed(title=f"{games_emoji('bank', '🏦')} Deposit", description=f"{games_money(amt)} moved into your bank", color=games_color("green"))
@@ -2470,14 +2796,14 @@ async def games_withdraw(interaction: discord.Interaction, amount: str):
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     uid = interaction.user.id
-    bal = games_coin_balance(uid)
+    bal = await async_db(games_coin_balance(uid))
     try:
         amt = bal["bank"] if str(amount).strip().lower() == "all" else int(amount)
     except (ValueError, TypeError):
         return await interaction.followup.send("❌ Amount must be a whole number or `all`.", ephemeral=True)
     if amt <= 0 or amt > GAMES_MAX_TRANSACTION:
         return await interaction.followup.send(f"❌ Amount must be between 1 and {GAMES_MAX_TRANSACTION:,}.", ephemeral=True)
-    ok, result = games_bank_move(uid, amt, "withdraw")
+    ok, result = await async_db(games_bank_move(uid, amt, "withdraw"))
     if not ok:
         return await interaction.followup.send(f"❌ {result}", ephemeral=True)
     embed = discord.Embed(title=f"{games_emoji('bank', '🏦')} Withdrawal", description=f"{games_money(amt)} moved to cash", color=games_color("green"))
@@ -2640,27 +2966,33 @@ class ShopView(discord.ui.View):
             await interaction.edit_original_response(view=self)
         except Exception:
             pass
-        ok, res = games_coin_spend(interaction.user.id, price, f"shop_{prepaid_kind}", meta={"item": item})
+        ok, res = await async_db(games_coin_spend(interaction.user.id, price, f"shop_{prepaid_kind}", meta={"item": item}))
         if not ok:
             self._busy = False
             self.refresh_buttons(interaction.user.id)
             await self._refresh_ui(interaction, interaction.user.id)
             return await interaction.followup.send(f"❌ {res}", ephemeral=True)
         try:
-            with conn.cursor() as cur:
-                col = {"hatch": "prepaid_hatches", "spin": "prepaid_spins", "scratch": "prepaid_scratches"}[prepaid_kind]
-                cur.execute(
-                    f"UPDATE mcwv_coins SET {col} = {col} + 1 WHERE discord_id = %s RETURNING {col}",
-                    (interaction.user.id,),
-                )
-                new_count = int(cur.fetchone()[0])
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        col = {"hatch": "prepaid_hatches", "spin": "prepaid_spins", "scratch": "prepaid_scratches"}[prepaid_kind]
+                        cur.execute(
+                            f"UPDATE mcwv_coins SET {col} = {col} + 1 WHERE discord_id = %s RETURNING {col}",
+                            (interaction.user.id,),
+                        )
+                        new_count = int(cur.fetchone()[0])
+                    conn.commit()
+                    return new_count
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            new_count = await async_db(_db_step)
         except Exception as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            games_coin_adjust(interaction.user.id, price, "shop_refund")
+            await async_db(games_coin_adjust(interaction.user.id, price, "shop_refund"))
             self._busy = False
             self.refresh_buttons(interaction.user.id)
             await self._refresh_ui(interaction, interaction.user.id)
@@ -2668,7 +3000,7 @@ class ShopView(discord.ui.View):
             return await interaction.followup.send("❌ Purchase failed — coins returned.", ephemeral=True)
         self._busy = False
         self.refresh_buttons(interaction.user.id)
-        bal = games_coin_balance(interaction.user.id)
+        bal = await async_db(games_coin_balance(interaction.user.id))
         await self._refresh_ui(
             interaction, interaction.user.id,
             confirm=(
@@ -2758,8 +3090,20 @@ async def games_spawn(interaction: discord.Interaction, action: app_commands.Cho
     pass
     try:
         if action.value == "guess":
-            # Basic guess start if available
-            await interaction.followup.send("🎮 Guess round started (staff).", ephemeral=True)
+            if interaction.channel.id in ACTIVE_GUESS_ROUNDS or interaction.channel.id in ACTIVE_GUESS_STARTING:
+                return await interaction.followup.send(
+                    "❌ A Guess the Pet round is already active or loading in this channel.", ephemeral=True)
+            started = await games_start_guess_round(interaction.channel, rewarded=False, source="staff_spawn")
+            if isinstance(started, str):
+                return await interaction.followup.send(started, ephemeral=True)
+            if started is False:
+                return await interaction.followup.send("🛑 Round preparation was cancelled.", ephemeral=True)
+            if not started:
+                return await interaction.followup.send(
+                    "❌ Could not start the round — no usable pet data available.", ephemeral=True)
+            return await interaction.followup.send(
+                f"🎮 Guess round started — **{started['pet_name']}** is in <#{interaction.channel.id}>!",
+                ephemeral=True)
         elif action.value == "case":
                 await interaction.followup.send(
                     embed=discord.Embed(title="🎁 Staff Case Drop!", description="First click claims a free case — only 1 allowed.", color=discord.Color.gold()),
@@ -2781,7 +3125,6 @@ async def games_spawn(interaction: discord.Interaction, action: app_commands.Cho
 
 
 @bot.tree.command(name="equip", description="Equip your cosmetic role (DB list)", guild=guild_obj)
-@app_commands.describe(action="What to do")
 async def games_equip(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     if not games_gate_allowed(interaction):
@@ -2789,7 +3132,7 @@ async def games_equip(interaction: discord.Interaction):
     member = interaction.user
     if not member or not isinstance(member, discord.Member):
         return await interaction.followup.send("❌ Must be used in server.", ephemeral=True)
-    db_owned_ids = get_user_cosmetic_roles(member.id)
+    db_owned_ids = await async_db(get_user_cosmetic_roles(member.id))
     if not db_owned_ids:
         # fallback to Discord roles
         owned = [r for r in member.roles if int(r.id) in COSMETIC_ROLE_IDS]
@@ -2823,7 +3166,7 @@ async def games_equip(interaction: discord.Interaction):
             pass
     # Mark selected in DB (optional: could save best specifically; already saved)
     try:
-        set_user_cosmetic_role(member.id, best.id if best else (owned[0].id if owned else 0))
+        await async_db(set_user_cosmetic_role(member.id, best.id if best else (owned[0].id if owned else 0)))
     except Exception:
         pass
     # Build embed with current owned list
@@ -2850,13 +3193,23 @@ async def games_cases(interaction: discord.Interaction):
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM mcwv_cases WHERE enabled = TRUE")
-            total_cases = int(cur.fetchone()[0] or 0)
-            cur.execute(
-                "SELECT id, name, price, emoji FROM mcwv_cases WHERE enabled = TRUE ORDER BY price ASC LIMIT 25"
-            )
-            rows = cur.fetchall()
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM mcwv_cases WHERE enabled = TRUE")
+                    total_cases = int(cur.fetchone()[0] or 0)
+                    cur.execute(
+                        "SELECT id, name, price, emoji FROM mcwv_cases WHERE enabled = TRUE ORDER BY price ASC LIMIT 25"
+                    )
+                    rows = cur.fetchall()
+                return total_cases, rows
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        total_cases, rows = await async_db(_db_step)
         if not rows:
             return await interaction.followup.send("No cases yet — staff will add some soon!", ephemeral=True)
         embed = discord.Embed(title=f"{games_emoji('case_open', '🎁')} Role Cases", color=games_color("violet"),
@@ -2927,30 +3280,49 @@ class CaseConfirmView(discord.ui.View):
             pass
         # Never honour a stale confirmation after staff disabled/repriced it.
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT price, enabled FROM mcwv_cases WHERE id = %s", (self.case_id,))
-                live_case = cur.fetchone()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT price, enabled FROM mcwv_cases WHERE id = %s", (self.case_id,))
+                        live_case = cur.fetchone()
+                    return live_case
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            live_case = await async_db(_db_step)
             if not live_case or not live_case[1] or int(live_case[0]) != self.price:
                 self.rolled = False
                 return await roll_msg.edit(content="❌ This case changed or was disabled — run `/case` again.")
         except Exception:
             self.rolled = False
             return await roll_msg.edit(content="❌ Couldn't verify this case — you were not charged.")
-        ok, res = games_coin_spend(interaction.user.id, self.price, "case_open", meta={"case": self.case_name})
+        ok, res = await async_db(games_coin_spend(interaction.user.id, self.price, "case_open", meta={"case": self.case_name}))
         if not ok:
             self.rolled = False
             return await interaction.followup.send(f"❌ {res}", ephemeral=True)
         won = games_weighted_choice(self.roles, self.weights)
         if won is None:
             try:
-                with conn.cursor() as cur:
-                    cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, price_paid) VALUES (%s,%s,%s)",
-                                (self.case_id, interaction.user.id, self.price))
-                conn.commit()
+                def _db_step():
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, price_paid) VALUES (%s,%s,%s)",
+                                        (self.case_id, interaction.user.id, self.price))
+                        conn.commit()
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        raise
+                await async_db(_db_step)
             except Exception:
                 pass
-            games_track("case", interaction.channel_id, burned=self.price)
-            games_track_user("case", interaction.user.id, win=False)
+            await async_db(games_track("case", interaction.channel_id, burned=self.price))
+            await async_db(games_track_user("case", interaction.user.id, win=False))
             reveal = discord.Embed(
                 title=f"{self.emoji} {self.case_name}",
                 description="The case rattles… and **nothing** falls out. 😔",
@@ -2968,11 +3340,11 @@ class CaseConfirmView(discord.ui.View):
             if isinstance(member, discord.Member) and won in member.roles:
                 # Duplicate protection keeps a paid roll from feeling completely dead.
                 duplicate_credit = max(1, self.price // 2)
-                games_coin_adjust(member.id, duplicate_credit, "case_duplicate", meta={"case": self.case_name, "role": won.id})
+                await async_db(games_coin_adjust(member.id, duplicate_credit, "case_duplicate", meta={"case": self.case_name, "role": won.id}))
             elif isinstance(member, discord.Member):
                 if int(won.id) in COSMETIC_ROLE_IDS:
                     # Cosmetic: save to list, don't auto-equip — use /equip
-                    set_user_cosmetic_role(member.id, int(won.id))
+                    await async_db(set_user_cosmetic_role(member.id, int(won.id)))
                     role_granted = True
                     # Send reminder message (if interaction available; else skip silent)
                     try:
@@ -2984,21 +3356,30 @@ class CaseConfirmView(discord.ui.View):
                 else:
                     await member.add_roles(won, reason=f"Unboxed from case '{self.case_name}'")
                     role_granted = True
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, won_role_id, price_paid) VALUES (%s,%s,%s,%s)",
-                            (self.case_id, interaction.user.id, won.id, self.price))
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, won_role_id, price_paid) VALUES (%s,%s,%s,%s)",
+                                    (self.case_id, interaction.user.id, won.id, self.price))
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            await async_db(_db_step)
         except Exception as exc:
             print(f"[games] case role grant failed: {exc}")
             if not duplicate_credit and not role_granted:
                 # A permission/API failure should not eat the player's roll.
-                games_coin_adjust(interaction.user.id, self.price, "case_grant_refund", meta={"case": self.case_name})
+                await async_db(games_coin_adjust(interaction.user.id, self.price, "case_grant_refund", meta={"case": self.case_name}))
                 return await roll_msg.edit(content="❌ I couldn't grant that role — your coins were refunded.", embed=None)
             # If Discord granted the role but only the audit insert failed, never
             # refund as well: that would turn a transient DB error into a free role.
             print(f"[games] case reward granted but roll audit failed: case={self.case_id} user={interaction.user.id}")
-        games_track("case", interaction.channel_id, burned=max(0, self.price - duplicate_credit))
-        games_track_user("case", interaction.user.id, win=role_granted)
+        await async_db(games_track("case", interaction.channel_id, burned=max(0, self.price - duplicate_credit)))
+        await async_db(games_track_user("case", interaction.user.id, win=role_granted))
         chance = float(self.weights[self.roles.index(won)])
         is_rare = chance <= 5
         reveal = discord.Embed(
@@ -3035,14 +3416,18 @@ async def games_case_open(interaction: discord.Interaction, name: str):
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, name, price, emoji FROM mcwv_cases WHERE enabled = TRUE AND LOWER(name) = LOWER(%s)", (name.strip(),))
-            case = cur.fetchone()
-            if not case:
-                return await interaction.followup.send("❌ Case not found.", ephemeral=True)
-            cid, cname, price, emoji = case
-            cur.execute("SELECT role_id, chance FROM mcwv_case_contents WHERE case_id = %s ORDER BY chance DESC", (cid,))
-            contents = cur.fetchall()
+        def _db_lookup():
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name, price, emoji FROM mcwv_cases WHERE enabled = TRUE AND LOWER(name) = LOWER(%s)", (name.strip(),))
+                case_row = cur.fetchone()
+                if case_row is None:
+                    return None, None
+                cur.execute("SELECT role_id, chance FROM mcwv_case_contents WHERE case_id = %s ORDER BY chance DESC", (case_row[0],))
+                return case_row, cur.fetchall()
+        case, contents = await async_db(_db_lookup)
+        if case is None:
+            return await interaction.followup.send("❌ Case not found.", ephemeral=True)
+        cid, cname, price, emoji = case
         if not contents:
             return await interaction.followup.send("❌ That case has no contents yet.", ephemeral=True)
 
@@ -3075,14 +3460,16 @@ async def games_case_open(interaction: discord.Interaction, name: str):
             weights.append(filler_weight)
             lines.append(f"\u2b1c Nothing \u2014 **{filler_weight:g}%** `{games_bar(filler_weight, 100, 8)}`")
 
-        bal = games_coin_balance(interaction.user.id)
-        can_afford = games_is_unlimited(interaction.user.id) or bal["balance"] >= int(price)
+        bal = await async_db(games_coin_balance(interaction.user.id))
+        _dbv1_3093 = await async_db(games_is_unlimited(interaction.user.id))
+        can_afford = _dbv1_3093 or bal["balance"] >= int(price)
         embed = discord.Embed(
             title=f"{emoji} {cname}",
             description="\n".join(lines) or "No contents.",
             color=games_color("violet"),
         )
-        embed.add_field(name="Price", value=f"**{int(price):,}** 🪙" + (" \u00b7 \u221e unlimited" if games_is_unlimited(interaction.user.id) else ""), inline=True)
+        _dbv1_3099 = await async_db(games_is_unlimited(interaction.user.id))
+        embed.add_field(name="Price", value=f"**{int(price):,}** 🪙" + (" \u00b7 \u221e unlimited" if _dbv1_3099 else ""), inline=True)
         embed.add_field(name="Your cash", value=f"**{bal['balance']:,}**" + ("" if can_afford else " \u2014 not enough!"), inline=True)
         if getattr(guild, "icon", None):
             embed.set_thumbnail(url=guild.icon.url)
@@ -3119,10 +3506,20 @@ async def coins_admin(interaction: discord.Interaction, action: str, user: disco
 
     if action == "ledger":
         try:
-            with conn.cursor() as cur:
-                cur.execute("""SELECT id, actor_id, target_id, type, amount, balance_after, created_at
-                               FROM mcwv_coin_log ORDER BY id DESC LIMIT 15""")
-                rows = cur.fetchall()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""SELECT id, actor_id, target_id, type, amount, balance_after, created_at
+                                       FROM mcwv_coin_log ORDER BY id DESC LIMIT 15""")
+                        rows = cur.fetchall()
+                    return rows
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            rows = await async_db(_db_step)
             lines = [f"`#{r[0]}` <@{r[2]}> **{r[3]}** {r[4]:+,} (bal {r[5]:,})" for r in rows] or ["Ledger empty."]
             embed = discord.Embed(title="🧾 Recent Coin Ledger", description="\n".join(lines), color=discord.Color.greyple())
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -3132,11 +3529,21 @@ async def coins_admin(interaction: discord.Interaction, action: str, user: disco
 
     if action == "audit":
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COALESCE(SUM(balance + bank), 0) FROM mcwv_coins")
-                total_bal = int(cur.fetchone()[0])
-                cur.execute("SELECT COALESCE(SUM(amount), 0) FROM mcwv_coin_log")
-                total_flow = int(cur.fetchone()[0])
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT COALESCE(SUM(balance + bank), 0) FROM mcwv_coins")
+                        total_bal = int(cur.fetchone()[0])
+                        cur.execute("SELECT COALESCE(SUM(amount), 0) FROM mcwv_coin_log")
+                        total_flow = int(cur.fetchone()[0])
+                    return total_bal, total_flow
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            total_bal, total_flow = await async_db(_db_step)
             difference = total_bal - total_flow
             await interaction.followup.send(
                 f"📊 **Audit**\nTotal cash + bank: **{total_bal:,}**\nNet ledger flow: **{total_flow:,}**\n"
@@ -3155,15 +3562,15 @@ async def coins_admin(interaction: discord.Interaction, action: str, user: disco
         return await interaction.followup.send(
             f"❌ Amount must be between 0 and {GAMES_MAX_TRANSACTION:,}.", ephemeral=True)
     if action == "add":
-        ok, res = games_coin_adjust(user.id, int(amount), "admin_add", actor_id=interaction.user.id)
+        ok, res = await async_db(games_coin_adjust(user.id, int(amount), "admin_add", actor_id=interaction.user.id))
         return await interaction.followup.send(f"✅ +{amount:,} to {user.mention}." if ok else f"❌ {res}", ephemeral=True)
     if action == "remove":
-        ok, res = games_coin_adjust(user.id, -int(amount), "admin_remove", actor_id=interaction.user.id)
+        ok, res = await async_db(games_coin_adjust(user.id, -int(amount), "admin_remove", actor_id=interaction.user.id))
         return await interaction.followup.send(f"✅ −{amount:,} from {user.mention}." if ok else f"❌ {res}", ephemeral=True)
     if action == "set":
-        bal = games_coin_balance(user.id)
+        bal = await async_db(games_coin_balance(user.id))
         delta = int(amount) - bal["balance"]
-        ok, res = games_coin_adjust(user.id, delta, "admin_set", actor_id=interaction.user.id)
+        ok, res = await async_db(games_coin_adjust(user.id, delta, "admin_set", actor_id=interaction.user.id))
         return await interaction.followup.send(f"✅ {user.mention} balance set to {amount:,}." if ok else f"❌ {res}", ephemeral=True)
     return await interaction.followup.send("Unknown action.", ephemeral=True)
 
@@ -3534,9 +3941,10 @@ async def games_guess_timeout(channel_id, started):
         return
     ACTIVE_GUESS_ROUNDS.pop(channel_id, None)
     games_guess_cancel_clock(channel_id)
+    await async_db(games_session_end, f"guess:{channel_id}")
     if round_info.get("rewarded", True):
         games_guess_record_result(round_info)
-        games_track_participants("guess", round_info.get("participants"), winner_id=None)
+        await async_db(games_track_participants("guess", round_info.get("participants"), winner_id=None))
     channel = bot.get_channel(channel_id)
     if channel is None:
         return
@@ -3674,7 +4082,13 @@ async def games_start_guess_round(channel, pet_key=None, mode=None, rewarded=Tru
             round_message = await channel.send(embed=round_embed)
         round_info["message_id"] = getattr(round_message, "id", None)
         ACTIVE_GUESS_ROUNDS[channel_id] = round_info
-        games_track("guess", channel_id, sessions=1)
+        await async_db(games_session_save, f"guess:{channel_id}", "guess", {
+            "channel_id": channel_id, "started": round_info["started"],
+            "pet_name": round_info["pet_name"], "mode": round_info["mode"],
+            "rewarded": round_info["rewarded"], "participants": [],
+            "message_id": round_info["message_id"],
+        })
+        await async_db(games_track("guess", channel_id, sessions=1))
         clock = asyncio.create_task(games_guess_clock(channel_id, started))
         ACTIVE_GUESS_TASKS[channel_id] = clock
         return round_info
@@ -3723,7 +4137,8 @@ async def games_maybe_spawn(message):
     if now - float(_spawn_last_global.get("ts", 0)) < GAMES_SPAWN_GLOBAL_COOLDOWN:
         return
     try:
-        chance = float(db_get_setting(GAMES_SETTING_SPAWN_CHANCE, str(GAMES_DEFAULT_CHANCE_PCT)) or GAMES_DEFAULT_CHANCE_PCT)
+        _dbv1_3740 = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANCE, str(GAMES_DEFAULT_CHANCE_PCT)))
+        chance = float(_dbv1_3740 or GAMES_DEFAULT_CHANCE_PCT)
     except Exception:
         chance = GAMES_DEFAULT_CHANCE_PCT
     if not games_roll_chance(chance):
@@ -3785,24 +4200,25 @@ async def games_handle_answer(message):
     # Pop before the first await: two near-simultaneous correct messages cannot both win.
     ACTIVE_GUESS_ROUNDS.pop(message.channel.id, None)
     games_guess_cancel_clock(message.channel.id)
+    await async_db(games_session_end, f"guess:{message.channel.id}")
     elapsed = max(0.0, time.time() - float(round_info["started"]))
     rewarded_round = bool(round_info.get("rewarded", True))
     previous = games_guess_profile(message.author.id)
     reward = games_guess_reward(round_info, elapsed, previous.get("current_streak", 0))
     if reward > 0:
-        paid, error = games_coin_adjust(
+        paid, error = await async_db(games_coin_adjust(
             message.author.id, reward, "guess_win",
             meta={"pet": round_info["pet_name"], "mode": round_info["mode"],
                   "seconds": round(elapsed, 3), "hints": round_info.get("hint_step", 0)},
-        )
+        ))
         if not paid:
             print(f"[games] guess reward failed for {message.author.id}: {error}")
             reward = 0
     if rewarded_round:
         elapsed_ms = int(round(elapsed * 1000))
         games_guess_record_result(round_info, message.author.id, reward, elapsed_ms)
-        games_track("guess", message.channel.id, sessions=0, minted=reward)
-        games_track_participants("guess", round_info.get("participants"), winner_id=message.author.id)
+        await async_db(games_track("guess", message.channel.id, sessions=0, minted=reward))
+        await async_db(games_track_participants("guess", round_info.get("participants"), winner_id=message.author.id))
         profile = games_guess_profile(message.author.id)
     else:
         # Staff practice cannot farm coins, leaderboard wins, streaks or role progress.
@@ -3894,14 +4310,24 @@ async def games_guess(interaction: discord.Interaction, action: str, mode: str =
     if action == "stats":
         profile = games_guess_profile(interaction.user.id)
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT sessions, coins_minted FROM mcwv_game_stats WHERE game = 'guess'")
-                global_row = cur.fetchone()
-                cur.execute(
-                    """SELECT discord_id, wins, best_streak FROM mcwv_guess_profiles
-                       ORDER BY wins DESC, best_streak DESC LIMIT 5"""
-                )
-                leaders = cur.fetchall()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT sessions, coins_minted FROM mcwv_game_stats WHERE game = 'guess'")
+                        global_row = cur.fetchone()
+                        cur.execute(
+                            """SELECT discord_id, wins, best_streak FROM mcwv_guess_profiles
+                               ORDER BY wins DESC, best_streak DESC LIMIT 5"""
+                        )
+                        leaders = cur.fetchall()
+                    return global_row, leaders
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            global_row, leaders = await async_db(_db_step)
         except Exception:
             global_row, leaders = None, []
         rounds = profile["rounds"]
@@ -3952,6 +4378,7 @@ async def games_guess(interaction: discord.Interaction, action: str, mode: str =
                 return await interaction.followup.send("🛑 Round preparation cancelled.", ephemeral=True)
             return await interaction.followup.send("No active round in this channel.", ephemeral=True)
         games_guess_cancel_clock(interaction.channel.id)
+        await async_db(games_session_end, f"guess:{interaction.channel.id}")
         return await interaction.followup.send(
             f"🛑 {'Practice' if not round_info.get('rewarded', True) else 'Rewarded'} round stopped — "
             f"it was **{round_info.get('pet_name', '?')}**.", ephemeral=False
@@ -4001,12 +4428,22 @@ async def games_pets(interaction: discord.Interaction, user: discord.User = None
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     target = user or interaction.user
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pet_key, count, first_hatched_at FROM mcwv_pet_collections WHERE discord_id = %s ORDER BY count DESC, pet_key ASC LIMIT 25", (target.id,))
-            rows = cur.fetchall()
-            cur.execute("SELECT COUNT(*), COALESCE(SUM(count), 0) FROM mcwv_pet_collections WHERE discord_id = %s", (target.id,))
-            agg = cur.fetchone()
-            total_unique, total_pets = int(agg[0] or 0), int(agg[1] or 0)
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pet_key, count, first_hatched_at FROM mcwv_pet_collections WHERE discord_id = %s ORDER BY count DESC, pet_key ASC LIMIT 25", (target.id,))
+                    rows = cur.fetchall()
+                    cur.execute("SELECT COUNT(*), COALESCE(SUM(count), 0) FROM mcwv_pet_collections WHERE discord_id = %s", (target.id,))
+                    agg = cur.fetchone()
+                    total_unique, total_pets = int(agg[0] or 0), int(agg[1] or 0)
+                return rows, total_unique, total_pets
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        rows, total_unique, total_pets = await async_db(_db_step)
         if not rows:
             return await interaction.followup.send(f"{target.display_name} hasn't hatched anything yet — try `/hatch`!", ephemeral=True)
         lines = []
@@ -4016,7 +4453,8 @@ async def games_pets(interaction: discord.Interaction, user: discord.User = None
                 else games_emoji("huge", "💥") if name.startswith("Huge") else games_emoji("pets", "🐾")
             lines.append(f"{emoji} **{name}** ×{count}")
         # collection completion vs the real pet database
-        total_in_db = len(games_get_pets())
+        _dbv1_4033 = await async_db(games_get_pets())
+        total_in_db = len(_dbv1_4033)
         pct = (total_unique / total_in_db * 100) if total_in_db else 0
         embed = discord.Embed(
             title=f"🐾 {target.display_name}'s Pet Collection",
@@ -4226,17 +4664,22 @@ class DuelChallengeView(discord.ui.View):
         ACTIVE_DUELS.pop(self.duel_id, None)
         if db_enabled():
             try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE mcwv_duels SET state = 'expired' WHERE id = %s AND state = 'pending'",
-                        (int(self.duel_id),),
-                    )
-                conn.commit()
+                def _db_step():
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE mcwv_duels SET state = 'expired' WHERE id = %s AND state = 'pending'",
+                                (int(self.duel_id),),
+                            )
+                        conn.commit()
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        raise
+                await async_db(_db_step)
             except Exception as exc:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
                 print(f"[games] pending duel expiry failed: {exc}")
         for child in self.children:
             child.disabled = True
@@ -4294,9 +4737,18 @@ class DuelChallengeView(discord.ui.View):
             duel["state"] = "declined"
         self.stop()
         try:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE mcwv_duels SET state = 'declined' WHERE id = %s", (int(self.duel_id),))
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE mcwv_duels SET state = 'declined' WHERE id = %s", (int(self.duel_id),))
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            await async_db(_db_step)
         except Exception:
             pass
         try:
@@ -4472,10 +4924,10 @@ async def settle_duel(duel_id, winner_id, reason):
         winner_id = int(winner_id)
         pot = int(result)
         # The pot was escrowed from both players: this is circulation, not minting.
-        games_track("duel", duel.get("channel_id", 0))
-        games_track_user("duel", winner_id, win=True)
+        await async_db(games_track("duel", duel.get("channel_id", 0)))
+        await async_db(games_track_user("duel", winner_id, win=True))
         loser_id = duel["target"] if winner_id == int(duel["challenger"]) else duel["challenger"]
-        games_track_user("duel", loser_id, win=False)
+        await async_db(games_track_user("duel", loser_id, win=False))
         try:
             guild = bot.get_guild(GUILD_ID)
             if guild:
@@ -4531,12 +4983,22 @@ async def games_duel(interaction: discord.Interaction, user: discord.User, wager
             return await interaction.followup.send("❌ That player already has an active duel.", ephemeral=True)
     game_type = secrets.choice(["guess", "scramble", "existcount"])
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO mcwv_duels (challenger, target, wager, game_type, state) VALUES (%s,%s,%s,%s,'pending') RETURNING id",
-                (interaction.user.id, user.id, wager, game_type))
-            duel_id = int(cur.fetchone()[0])
-        conn.commit()
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO mcwv_duels (challenger, target, wager, game_type, state) VALUES (%s,%s,%s,%s,'pending') RETURNING id",
+                        (interaction.user.id, user.id, wager, game_type))
+                    duel_id = int(cur.fetchone()[0])
+                conn.commit()
+                return duel_id
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        duel_id = await async_db(_db_step)
     except Exception as exc:
         return await interaction.followup.send(f"❌ Could not create duel: `{type(exc).__name__}`", ephemeral=True)
     ACTIVE_DUELS[duel_id] = {
@@ -4576,7 +5038,8 @@ async def games_scramble(interaction: discord.Interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.channel.id in ACTIVE_SCRAMBLE:
         return await interaction.followup.send("❌ A scramble is already active in this channel.", ephemeral=True)
-    allowed, retry_at = (True, None) if games_is_unlimited(interaction.user.id) else games_cooldown_claim(
+    _dbv1_4589 = await async_db(games_is_unlimited(interaction.user.id))
+    allowed, retry_at = (True, None) if _dbv1_4589 else games_cooldown_claim(
         interaction.channel.id, "scramble_channel", GAMES_SCRAMBLE_CHANNEL_COOLDOWN
     )
     if not allowed:
@@ -4588,9 +5051,14 @@ async def games_scramble(interaction: discord.Interaction):
     shuffled = letters[:]
     while len(shuffled) > 1 and shuffled == letters:
         secrets.SystemRandom().shuffle(shuffled)
+    _started = time.time()
     ACTIVE_SCRAMBLE[interaction.channel.id] = {
-        "answer": word, "started": time.time(), "attempts": {}, "participants": set()
+        "answer": word, "started": _started, "attempts": {}, "participants": set()
     }
+    await async_db(games_session_save, f"scramble:{interaction.channel.id}", "scramble", {
+        "channel_id": interaction.channel.id, "started": _started,
+        "answer": word, "participants": [],
+    })
     embed = discord.Embed(
         title="🔀 Scramble",
         description="Unscramble this pet name — first correct wins **`100` 🪙**!",
@@ -4609,6 +5077,7 @@ async def games_handle_scramble(message):
         return False
     if time.time() - float(s["started"]) > GAMES_ROUND_TIMEOUT:
         ACTIVE_SCRAMBLE.pop(message.channel.id, None)
+        await async_db(games_session_end, f"scramble:{message.channel.id}")
         return False
     # Ignore normal channel chat; only same-letter candidate answers consume an attempt.
     candidate = normalize_answer(message.content)
@@ -4622,9 +5091,10 @@ async def games_handle_scramble(message):
     s.setdefault("participants", set()).add(message.author.id)
     if games_answers_match(message.content, s["answer"]):
         ACTIVE_SCRAMBLE.pop(message.channel.id, None)
-        games_coin_adjust(message.author.id, 100, "scramble_win", meta={"word": s["answer"]})
-        games_track("scramble", message.channel.id, minted=100)
-        games_track_participants("scramble", s.get("participants"), winner_id=message.author.id)
+        await async_db(games_session_end, f"scramble:{message.channel.id}")
+        await async_db(games_coin_adjust(message.author.id, 100, "scramble_win", meta={"word": s["answer"]}))
+        await async_db(games_track("scramble", message.channel.id, minted=100))
+        await async_db(games_track_participants("scramble", s.get("participants"), winner_id=message.author.id))
         embed = discord.Embed(
             title="🎉 Scramble Solved!",
             description=f"**{getattr(message.author, 'mention', '')}** unscrambled it — **{s['answer']}**!",
@@ -4646,7 +5116,8 @@ async def games_hangman(interaction: discord.Interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.channel.id in ACTIVE_HANGMAN:
         return await interaction.followup.send("❌ A hangman game is already active here.", ephemeral=True)
-    allowed, retry_at = (True, None) if games_is_unlimited(interaction.user.id) else games_cooldown_claim(
+    _dbv1_4659 = await async_db(games_is_unlimited(interaction.user.id))
+    allowed, retry_at = (True, None) if _dbv1_4659 else games_cooldown_claim(
         interaction.channel.id, "hangman_channel", GAMES_HANGMAN_CHANNEL_COOLDOWN
     )
     if not allowed:
@@ -4655,10 +5126,15 @@ async def games_hangman(interaction: discord.Interaction):
     pool = games_random_word_pool()
     word = games_pick_random(pool, scope=f"hangman:{interaction.channel.id}", max_recent=8).lower()
     core = re.sub(r"[^a-z]", "", word)
+    _started = time.time()
     ACTIVE_HANGMAN[interaction.channel.id] = {
-        "word": word, "core": core, "guessed": set(), "wrong": 0, "started": time.time(),
+        "word": word, "core": core, "guessed": set(), "wrong": 0, "started": _started,
         "full_guesses": {}, "participants": set(),
     }
+    await async_db(games_session_save, f"hangman:{interaction.channel.id}", "hangman", {
+        "channel_id": interaction.channel.id, "started": _started,
+        "word": word, "core": core, "participants": [],
+    })
     msg = await interaction.followup.send(embed=render_hangman_embed(interaction.channel.id))
     ACTIVE_HANGMAN[interaction.channel.id]["msg"] = msg
 
@@ -4714,12 +5190,14 @@ async def games_handle_hangman(message):
         return False
     if time.time() - float(g["started"]) > 300:
         ACTIVE_HANGMAN.pop(message.channel.id, None)
+        await async_db(games_session_end, f"hangman:{message.channel.id}")
         return False
     content = message.content.strip().lower()
 
     async def finish(winner=None):
         ACTIVE_HANGMAN.pop(message.channel.id, None)
-        games_track_participants("hangman", g.get("participants"), winner_id=getattr(winner, "id", None))
+        await async_db(games_session_end, f"hangman:{message.channel.id}")
+        await async_db(games_track_participants("hangman", g.get("participants"), winner_id=getattr(winner, "id", None)))
         if winner is None:
             e = discord.Embed(
                 title="💀 Hangman Lost!",
@@ -4728,8 +5206,8 @@ async def games_handle_hangman(message):
             )
             e.set_footer(text="Run /hangman to try again")
         else:
-            games_coin_adjust(winner.id, 150, "hangman_win", meta={"word": g["word"]})
-            games_track("hangman", message.channel.id, minted=150)
+            await async_db(games_coin_adjust(winner.id, 150, "hangman_win", meta={"word": g["word"]}))
+            await async_db(games_track("hangman", message.channel.id, minted=150))
             e = discord.Embed(
                 title="🎉 Hangman Solved!",
                 description=f"**{getattr(winner, 'mention', '')}** solved it — **{g['word']}**!",
@@ -4900,12 +5378,22 @@ async def games_petdle(interaction: discord.Interaction, guess: str = None):
 
     if guess is None:
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT guesses, solved FROM mcwv_petdle_progress WHERE discord_id = %s AND day = CURRENT_DATE",
-                    (interaction.user.id,),
-                )
-                row = cur.fetchone()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT guesses, solved FROM mcwv_petdle_progress WHERE discord_id = %s AND day = CURRENT_DATE",
+                            (interaction.user.id,),
+                        )
+                        row = cur.fetchone()
+                    return row
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            row = await async_db(_db_step)
             guesses = row[0] if row and isinstance(row[0], list) else json.loads((row[0] if row else None) or "[]")
             solved = bool(row and row[1])
         except Exception:
@@ -4950,11 +5438,11 @@ async def games_petdle(interaction: discord.Interaction, guess: str = None):
         embed.add_field(name="Answer", value=f"**{target}**", inline=True)
         embed.add_field(name="Reward", value="+`200` 🪙" if result["awarded"] else "Already claimed ✅", inline=True)
         if result["awarded"]:
-            games_track("petdle", interaction.channel_id, minted=200)
-            games_track_user("petdle", interaction.user.id, win=True)
+            await async_db(games_track("petdle", interaction.channel_id, minted=200))
+            await async_db(games_track_user("petdle", interaction.user.id, win=True))
     elif lost:
         embed.add_field(name="Answer", value=f"**{target}**", inline=True)
-        games_track_user("petdle", interaction.user.id, win=False)
+        await async_db(games_track_user("petdle", interaction.user.id, win=False))
     elif len(guesses) >= 3:
         embed.add_field(name="💡 Hint", value=f"Starts with **{target_core[0].upper()}**", inline=True)
     games_footer(embed, "New puzzle at 00:00 UTC")
@@ -5225,16 +5713,18 @@ async def games_spin(interaction: discord.Interaction):
     await interaction.response.defer()
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
-    free, spins = games_free_use(interaction.user.id, "spin")
+    free, spins = await async_db(games_free_use(interaction.user.id, "spin"))
     if not free:
-        if not games_prepaid_consume(interaction.user.id, "spin"):
-            ok, res = games_coin_spend(interaction.user.id, GAMES_SPIN_COST_EXTRA, "spin_extra")
+        _dbv1_5240 = await async_db(games_prepaid_consume(interaction.user.id, "spin"))
+        if not _dbv1_5240:
+            ok, res = await async_db(games_coin_spend(interaction.user.id, GAMES_SPIN_COST_EXTRA, "spin_extra"))
             if not ok:
                 return await interaction.followup.send(f"❌ {res}", ephemeral=True)
 
     # ALWAYS log usage so the free spin can't be farmed on zero-prize outcomes
-    games_coin_log_zero(interaction.user.id, "spin", meta={"free": free})
-    spin_burned = 0 if free or games_is_unlimited(interaction.user.id) else GAMES_SPIN_COST_EXTRA
+    await async_db(games_coin_log_zero(interaction.user.id, "spin", meta={"free": free}))
+    _dbv1_5247 = await async_db(games_is_unlimited(interaction.user.id))
+    spin_burned = 0 if free or _dbv1_5247 else GAMES_SPIN_COST_EXTRA
 
     idx, label, rolled_amount, is_jackpot = games_spin_roll()
     jackpot_inc = secrets.randbelow(41) + 10  # jackpot grows 10-50 per spin
@@ -5249,27 +5739,27 @@ async def games_spin(interaction: discord.Interaction):
 
     embed = discord.Embed(title=f"{games_emoji('spin', '🎡')} Spin the Wheel", color=games_color("purple"))
     if is_jackpot:
-        games_track("spin", interaction.channel.id, minted=amount, burned=spin_burned)
-        games_track_user("spin", interaction.user.id, win=True)
+        await async_db(games_track("spin", interaction.channel.id, minted=amount, burned=spin_burned))
+        await async_db(games_track_user("spin", interaction.user.id, win=True))
         embed.color = games_color("gold")
         embed.title = f"{games_emoji('jackpot', '🎰')} JACKPOT!"
         embed.description = f"{interaction.user.mention} wins the whole **{amount:,}** coin jackpot! 🎆"
         embed.add_field(name="You won", value=games_money(amount), inline=True)
     elif amount > 0:
-        games_track("spin", interaction.channel.id, minted=amount, burned=spin_burned)
-        games_track_user("spin", interaction.user.id, win=True)
+        await async_db(games_track("spin", interaction.channel.id, minted=amount, burned=spin_burned))
+        await async_db(games_track_user("spin", interaction.user.id, win=True))
         embed.color = games_color("green")
         embed.description = f"\u2728 You landed on **{label}**!"
         embed.add_field(name="You won", value=games_money(amount), inline=True)
     elif item == "scratch":
-        games_track("spin", interaction.channel.id, burned=spin_burned)
-        games_track_user("spin", interaction.user.id, win=True)
+        await async_db(games_track("spin", interaction.channel.id, burned=spin_burned))
+        await async_db(games_track_user("spin", interaction.user.id, win=True))
         embed.color = games_color("cyan")
         embed.description = "🎴 You won a **free scratch card**!"
         embed.add_field(name="You won", value="**Extra Scratch ×1**", inline=True)
     else:
-        games_track("spin", interaction.channel.id, burned=spin_burned)
-        games_track_user("spin", interaction.user.id, win=False)
+        await async_db(games_track("spin", interaction.channel.id, burned=spin_burned))
+        await async_db(games_track_user("spin", interaction.user.id, win=False))
         embed.color = games_color("slate")
         embed.description = f"You landed on **{label}** \u2014 better luck next time!"
         embed.add_field(name="You won", value="nothing 😔", inline=True)
@@ -5345,14 +5835,16 @@ async def games_scratch(interaction: discord.Interaction):
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     # 1 free daily (atomic 24h window)
-    free, used = games_free_use(interaction.user.id, "scratch")
+    free, used = await async_db(games_free_use(interaction.user.id, "scratch"))
     if not free:
-        if not games_prepaid_consume(interaction.user.id, "scratch"):
-            ok, res = games_coin_spend(interaction.user.id, 100, "scratch_extra")
+        _dbv1_5360 = await async_db(games_prepaid_consume(interaction.user.id, "scratch"))
+        if not _dbv1_5360:
+            ok, res = await async_db(games_coin_spend(interaction.user.id, 100, "scratch_extra"))
             if not ok:
                 return await interaction.followup.send(f"❌ {res}", ephemeral=True)
-    games_coin_log_zero(interaction.user.id, "scratch", meta={"free": free})
-    scratch_burned = 0 if free or games_is_unlimited(interaction.user.id) else 100
+    await async_db(games_coin_log_zero(interaction.user.id, "scratch", meta={"free": free}))
+    _dbv1_5365 = await async_db(games_is_unlimited(interaction.user.id))
+    scratch_burned = 0 if free or _dbv1_5365 else 100
     pool = [p for p in GAMES_PET_SEED]
     tier_weights = []
     for p in pool:
@@ -5379,11 +5871,11 @@ async def games_scratch(interaction: discord.Interaction):
     elif best == 2:
         award = 100
     if award:
-        games_coin_adjust(interaction.user.id, award, "scratch_win", meta={"picks": picks, "pity": pity_triggered})
-        games_track("scratch", interaction.channel_id, minted=award, burned=scratch_burned)
+        await async_db(games_coin_adjust(interaction.user.id, award, "scratch_win", meta={"picks": picks, "pity": pity_triggered}))
+        await async_db(games_track("scratch", interaction.channel_id, minted=award, burned=scratch_burned))
     else:
-        games_track("scratch", interaction.channel_id, burned=scratch_burned)
-    games_track_user("scratch", interaction.user.id, win=award > 0)
+        await async_db(games_track("scratch", interaction.channel_id, burned=scratch_burned))
+    await async_db(games_track_user("scratch", interaction.user.id, win=award > 0))
     if best == 3:
         result_txt = f"{games_emoji('win', '🎆')} **TRIPLE MATCH! +{award:,}** 🪙"
         result_color = games_color("gold")
@@ -5479,9 +5971,19 @@ async def games_bingo(interaction: discord.Interaction):
     if not battle_id:
         return await interaction.followup.send("❌ No active or scheduled war found.", ephemeral=True)
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT card, marked FROM mcwv_bingo_cards WHERE discord_id = %s AND battle_id = %s", (interaction.user.id, str(battle_id)))
-            row = cur.fetchone()
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT card, marked FROM mcwv_bingo_cards WHERE discord_id = %s AND battle_id = %s", (interaction.user.id, str(battle_id)))
+                    row = cur.fetchone()
+                return row
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        row = await async_db(_db_step)
         if row:
             card = row[0] if isinstance(row[0], list) else json.loads(row[0] or "[]")
             marked = row[1] if isinstance(row[1], list) else json.loads(row[1] or "[]")
@@ -5494,21 +5996,31 @@ async def games_bingo(interaction: discord.Interaction):
         pool = GAMES_BINGO_EVENTS[:]
         secrets.SystemRandom().shuffle(pool)
         card = [ev[0] for ev in pool[:24]]
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO mcwv_bingo_cards (discord_id, battle_id, card)
-                   VALUES (%s,%s,%s::jsonb)
-                   ON CONFLICT (discord_id, battle_id) DO NOTHING
-                   RETURNING card, marked""",
-                (interaction.user.id, str(battle_id), json.dumps(card)))
-            inserted = cur.fetchone()
-            if inserted is None:
-                cur.execute(
-                    "SELECT card, marked FROM mcwv_bingo_cards WHERE discord_id = %s AND battle_id = %s",
-                    (interaction.user.id, str(battle_id)),
-                )
-                inserted = cur.fetchone()
-        conn.commit()
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO mcwv_bingo_cards (discord_id, battle_id, card)
+                           VALUES (%s,%s,%s::jsonb)
+                           ON CONFLICT (discord_id, battle_id) DO NOTHING
+                           RETURNING card, marked""",
+                        (interaction.user.id, str(battle_id), json.dumps(card)))
+                    inserted = cur.fetchone()
+                    if inserted is None:
+                        cur.execute(
+                            "SELECT card, marked FROM mcwv_bingo_cards WHERE discord_id = %s AND battle_id = %s",
+                            (interaction.user.id, str(battle_id)),
+                        )
+                        inserted = cur.fetchone()
+                conn.commit()
+                return inserted
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        inserted = await async_db(_db_step)
         if inserted:
             card = inserted[0] if isinstance(inserted[0], list) else json.loads(inserted[0] or "[]")
             marked = inserted[1] if isinstance(inserted[1], list) else json.loads(inserted[1] or "[]")
@@ -5762,16 +6274,13 @@ async def games_bingo_mark_all():
     try:
         await asyncio.to_thread(_mark, str(battle_id))
     except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         print(f"[games] bingo marking failed: {exc}")
         return
     if announcements:
         tier_emoji = {"line": "🎯", "bingo": "🎉", "blackout": "🌑"}
         try:
-            chans = json.loads(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]") or "[]")
+            _dbv1_5780 = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
+            chans = json.loads(_dbv1_5780 or "[]")
         except Exception:
             chans = []
         channel = bot.get_channel(int(chans[0])) if chans else None
@@ -5883,7 +6392,8 @@ async def games_housekeeping_loop():
             elapsed = now - float(s["started"])
             if elapsed > GAMES_ROUND_TIMEOUT:
                 ACTIVE_SCRAMBLE.pop(ch, None)
-                games_track_participants("scramble", s.get("participants"), winner_id=None)
+                await async_db(games_session_end, f"scramble:{ch}")
+                await async_db(games_track_participants("scramble", s.get("participants"), winner_id=None))
                 try:
                     channel = bot.get_channel(int(ch))
                     if channel:
@@ -5907,7 +6417,8 @@ async def games_housekeeping_loop():
         for ch, g in list(ACTIVE_HANGMAN.items()):
             if now - float(g["started"]) > 300:
                 ACTIVE_HANGMAN.pop(ch, None)
-                games_track_participants("hangman", g.get("participants"), winner_id=None)
+                await async_db(games_session_end, f"hangman:{ch}")
+                await async_db(games_track_participants("hangman", g.get("participants"), winner_id=None))
                 e = discord.Embed(title="⏰ Hangman Expired", description=f"It was **{g.get('word', '?')}**.", color=games_color("slate"))
                 await _hangman_update(g, e)
         # Fallback settlement if an in-memory timeout task was cancelled or lost.
@@ -5933,6 +6444,27 @@ async def games_housekeeping_loop():
                 ACTIVE_DUELS.pop(duel_id, None)
         except Exception as exc:
             print(f"[games] duel expiry failed: {type(exc).__name__}")
+        # Hygiene: drop session rows whose round is long gone. End-marks are the
+        # normal path (rows stay as tombstones until here); this catches any
+        # that were missed and keeps the table tiny.
+        try:
+            def _expire_stale_sessions():
+                worker = games_new_db_connection()
+                if worker is None:
+                    return 0
+                try:
+                    with worker.cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM mcwv_active_sessions WHERE updated_at < NOW() - INTERVAL '35 minutes'"
+                        )
+                        return int(cur.rowcount or 0)
+                finally:
+                    worker.close()
+            removed = await asyncio.to_thread(_expire_stale_sessions)
+            if removed:
+                print(f"[games] removed {removed} stale active-session row(s)")
+        except Exception as exc:
+            print(f"[games] session hygiene failed: {type(exc).__name__}")
         # Trivia sessions self-advance on question timeout; this is a final leak guard.
         for uid, s in list(ACTIVE_TRIVIA.items()):
             if now - float(s.get("last_activity", s.get("started", now))) > 10 * 60:
@@ -5941,13 +6473,16 @@ async def games_housekeeping_loop():
         for uid, s in list(ACTIVE_TOWER.items()):
             if not s.get("active"):
                 ACTIVE_TOWER.pop(uid, None)
+                await async_db(games_session_end, f"tower:{uid}")
                 continue
             if s.get("kind") and now - float(s.get("floor_started", now)) > GAMES_TOWER_FLOOR_TIMEOUT:
                 await games_tower_timeout(uid, s)
         # 2. Daily interest tick (1%/day, capped, integer math) — in a thread so
         #    it can never stall commands.
-        rate = float(db_get_setting(GAMES_SETTING_INTEREST_RATE, str(GAMES_INTEREST_RATE_PCT_DEFAULT)) or 0)
-        cap = int(db_get_setting(GAMES_SETTING_INTEREST_CAP, str(GAMES_INTEREST_CAP_DEFAULT)) or 0)
+        _dbv1_5955 = await async_db(db_get_setting(GAMES_SETTING_INTEREST_RATE, str(GAMES_INTEREST_RATE_PCT_DEFAULT)))
+        rate = float(_dbv1_5955 or 0)
+        _dbv1_5956 = await async_db(db_get_setting(GAMES_SETTING_INTEREST_CAP, str(GAMES_INTEREST_CAP_DEFAULT)))
+        cap = int(_dbv1_5956 or 0)
 
         def _interest_tick():
             if rate <= 0:
@@ -5996,10 +6531,6 @@ async def games_housekeeping_loop():
         try:
             await asyncio.to_thread(_interest_tick)
         except Exception as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             print(f"[games] interest tick failed: {exc}")
         # 3. Bingo marking (every 5 min only)
         if int(time.time()) % 300 < 60:
@@ -6015,7 +6546,8 @@ async def games_housekeeping_loop():
         except Exception as exc:
             print(f"[games] monthly petmaster check failed: {exc}")
         # 4. Real pet/egg sync (daily, threaded, batched — a few seconds)
-        last_sync = int(db_get_setting("games_eggs_synced_at", "0") or 0)
+        _dbv1_6020 = await async_db(db_get_setting("games_eggs_synced_at", "0"))
+        last_sync = int(_dbv1_6020 or 0)
         if time.time() - last_sync > 24 * 3600:
             # Pets first so every game sees current name→asset mappings before
             # newly synced egg contents can be hatched.
@@ -6030,10 +6562,10 @@ async def games_housekeeping_loop():
         # 5. Lottery auto-draw (Sunday 20:00 UTC window, threaded)
         now_dt = datetime.now(timezone.utc)
         if now_dt.weekday() == 6 and now_dt.hour >= 20:
-            last_draw = db_get_setting("games_lottery_last_draw_week", "")
+            last_draw = await async_db(db_get_setting("games_lottery_last_draw_week", ""))
             draw_key = now_dt.strftime("%Y-%m-%d")
             if last_draw != draw_key:
-                raw = db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]")
+                raw = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
                 try:
                     chans = json.loads(raw or "[]")
                 except Exception:
@@ -6041,7 +6573,7 @@ async def games_housekeeping_loop():
                 ch = bot.get_channel(int(chans[0])) if chans else None
                 # Draw even without an announcement channel; never mark it done first.
                 await games_lottery_draw(ch)
-                db_set_setting("games_lottery_last_draw_week", draw_key)
+                await async_db(db_set_setting("games_lottery_last_draw_week", draw_key))
         # Autocomplete callbacks consume only this worker-refreshed snapshot.
         await games_refresh_interaction_caches()
     except Exception as exc:
@@ -6245,15 +6777,25 @@ class CreateCaseModal(discord.ui.Modal, title="Create a role case"):
         await interaction.response.defer(ephemeral=True)
         try:
             duplicate = False
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (name,))
-                duplicate = cur.fetchone() is not None
-                if not duplicate:
-                    cur.execute(
-                        "INSERT INTO mcwv_cases (name, price, emoji, created_by) VALUES (%s,%s,%s,%s)",
-                        (name, price, use_emoji, interaction.user.id),
-                    )
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1 FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (name,))
+                        duplicate = cur.fetchone() is not None
+                        if not duplicate:
+                            cur.execute(
+                                "INSERT INTO mcwv_cases (name, price, emoji, created_by) VALUES (%s,%s,%s,%s)",
+                                (name, price, use_emoji, interaction.user.id),
+                            )
+                    conn.commit()
+                    return duplicate
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            duplicate = await async_db(_db_step)
             if duplicate:
                 return await interaction.followup.send("❌ A case with that name already exists.", ephemeral=True)
             await games_refresh_interaction_caches()
@@ -6262,10 +6804,6 @@ class CreateCaseModal(discord.ui.Modal, title="Create a role case"):
                 ephemeral=True,
             )
         except Exception as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             await interaction.followup.send(f"❌ Create failed: `{type(exc).__name__}`", ephemeral=True)
 
 
@@ -6293,13 +6831,23 @@ class EditCaseModal(discord.ui.Modal, title="Edit case details"):
         use_emoji = str(self.emoji).strip() if games_emoji_ok(str(self.emoji)) else "🎁"
         await interaction.response.defer(ephemeral=True)
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE mcwv_cases SET price = %s, emoji = %s WHERE id = %s RETURNING id",
-                    (price, use_emoji, self.case_id),
-                )
-                row = cur.fetchone()
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE mcwv_cases SET price = %s, emoji = %s WHERE id = %s RETURNING id",
+                            (price, use_emoji, self.case_id),
+                        )
+                        row = cur.fetchone()
+                    conn.commit()
+                    return row
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            row = await async_db(_db_step)
             if not row:
                 return await interaction.followup.send("❌ That case no longer exists.", ephemeral=True)
             await games_refresh_interaction_caches()
@@ -6339,31 +6887,41 @@ class AddCasePrizeChanceModal(discord.ui.Modal, title="Set prize chance"):
             error = None
             case_name = None
             new_total = 0.0
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT name FROM mcwv_cases WHERE id = %s FOR UPDATE", (self.case_id,))
-                    case_row = cur.fetchone()
-                    if not case_row:
-                        error = "That case no longer exists."
-                    else:
-                        case_name = str(case_row[0])
-                        cur.execute(
-                            """SELECT COALESCE(SUM(chance), 0),
-                                      COALESCE(MAX(chance) FILTER (WHERE role_id = %s), 0)
-                               FROM mcwv_case_contents WHERE case_id = %s""",
-                            (self.role_id, self.case_id),
-                        )
-                        used, previous = (float(v or 0) for v in cur.fetchone())
-                        new_total = used - previous + chance
-                        if new_total > 100.0001:
-                            error = (f"Total odds would be {new_total:.2f}%. "
-                                     f"Only {100 - used + previous:.2f}% is available.")
-                        else:
-                            cur.execute("""
-                                INSERT INTO mcwv_case_contents (case_id, role_id, chance)
-                                VALUES (%s,%s,%s)
-                                ON CONFLICT (case_id, role_id) DO UPDATE SET chance = EXCLUDED.chance
-                            """, (self.case_id, self.role_id, chance))
+            def _db_step():
+                try:
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT name FROM mcwv_cases WHERE id = %s FOR UPDATE", (self.case_id,))
+                            case_row = cur.fetchone()
+                            if not case_row:
+                                error = "That case no longer exists."
+                            else:
+                                case_name = str(case_row[0])
+                                cur.execute(
+                                    """SELECT COALESCE(SUM(chance), 0),
+                                              COALESCE(MAX(chance) FILTER (WHERE role_id = %s), 0)
+                                       FROM mcwv_case_contents WHERE case_id = %s""",
+                                    (self.role_id, self.case_id),
+                                )
+                                used, previous = (float(v or 0) for v in cur.fetchone())
+                                new_total = used - previous + chance
+                                if new_total > 100.0001:
+                                    error = (f"Total odds would be {new_total:.2f}%. "
+                                             f"Only {100 - used + previous:.2f}% is available.")
+                                else:
+                                    cur.execute("""
+                                        INSERT INTO mcwv_case_contents (case_id, role_id, chance)
+                                        VALUES (%s,%s,%s)
+                                        ON CONFLICT (case_id, role_id) DO UPDATE SET chance = EXCLUDED.chance
+                                    """, (self.case_id, self.role_id, chance))
+                    return error, case_name, new_total
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            error, case_name, new_total = await async_db(_db_step)
             if error:
                 return await interaction.followup.send(f"❌ {error}", ephemeral=True)
             await games_refresh_interaction_caches()
@@ -6426,13 +6984,23 @@ class RemoveCasePrizeSelect(discord.ui.Select):
         role_id = int(self.values[0])
         await interaction.response.defer(ephemeral=True)
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM mcwv_case_contents WHERE case_id = %s AND role_id = %s RETURNING role_id",
-                    (view.case_id, role_id),
-                )
-                row = cur.fetchone()
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM mcwv_case_contents WHERE case_id = %s AND role_id = %s RETURNING role_id",
+                            (view.case_id, role_id),
+                        )
+                        row = cur.fetchone()
+                    conn.commit()
+                    return row
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            row = await async_db(_db_step)
             await games_refresh_interaction_caches()
             await interaction.followup.send(
                 f"✅ Removed <@&{role_id}> from **{view.case_name}**." if row else "❌ Prize not found.",
@@ -6476,11 +7044,21 @@ class DeleteCaseConfirmView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s", (self.case_id,))
-                    cur.execute("DELETE FROM mcwv_cases WHERE id = %s RETURNING id", (self.case_id,))
-                    deleted = cur.fetchone()
+            def _db_step():
+                try:
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s", (self.case_id,))
+                            cur.execute("DELETE FROM mcwv_cases WHERE id = %s RETURNING id", (self.case_id,))
+                            deleted = cur.fetchone()
+                    return deleted
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            deleted = await async_db(_db_step)
             self.stop()
             await games_refresh_interaction_caches()
             await interaction.edit_original_response(
@@ -6584,10 +7162,20 @@ class CaseAdminPanelView(discord.ui.View):
             return await interaction.response.send_message("Select a case first.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         try:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE mcwv_cases SET enabled = NOT enabled WHERE id = %s RETURNING enabled", (case["id"],))
-                row = cur.fetchone()
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE mcwv_cases SET enabled = NOT enabled WHERE id = %s RETURNING enabled", (case["id"],))
+                        row = cur.fetchone()
+                    conn.commit()
+                    return row
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            row = await async_db(_db_step)
             if not row:
                 return await interaction.followup.send("❌ That case no longer exists.", ephemeral=True)
             await games_refresh_interaction_caches()
@@ -6655,15 +7243,20 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
             # emoji must register correctly — validate or fall back to 🎁
             use_emoji = emoji.strip() if games_emoji_ok(emoji) else "🎁"
             emoji_note = "" if use_emoji == (emoji or "").strip() else " (invalid emoji — using 🎁)"
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (case.strip(),))
-                if cur.fetchone():
-                    return await interaction.followup.send("❌ A case with that name already exists.", ephemeral=True)
-                cur.execute(
-                    "INSERT INTO mcwv_cases (name, price, emoji, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (case.strip(), int(price), use_emoji, interaction.user.id))
-                cid = cur.fetchone()[0]
-            conn.commit()
+            def _db_create():
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (case.strip(),))
+                    if cur.fetchone():
+                        return None
+                    cur.execute(
+                        "INSERT INTO mcwv_cases (name, price, emoji, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
+                        (case.strip(), int(price), use_emoji, interaction.user.id))
+                    cid = int(cur.fetchone()[0])
+                    conn.commit()
+                    return cid
+            cid = await async_db(_db_create)
+            if cid is None:
+                return await interaction.followup.send("❌ A case with that name already exists.", ephemeral=True)
             await games_refresh_interaction_caches()
             return await interaction.followup.send(
                 f"✅ Case **{case}** created ({price:,} coins, id {cid}){emoji_note}. Add roles with `/caseadmin add`.",
@@ -6686,43 +7279,56 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
             me = interaction.guild.me
             if me and role >= me.top_role:
                 return await interaction.followup.send("❌ That role is above my top role — I couldn't grant it.", ephemeral=True)
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (case.strip(),))
-                row = cur.fetchone()
-                if not row:
-                    return await interaction.followup.send("❌ Case not found.", ephemeral=True)
-                cid = int(row[0])
-                cur.execute(
-                    "SELECT COALESCE(SUM(chance), 0), COALESCE(MAX(chance) FILTER (WHERE role_id = %s), 0) "
-                    "FROM mcwv_case_contents WHERE case_id = %s",
-                    (role.id, cid),
-                )
-                used, previous = (float(x or 0) for x in cur.fetchone())
-                new_total = used - previous + chance
-                if new_total > 100:
-                    return await interaction.followup.send(
-                        f"❌ Chances would total {new_total:g}% — max 100% (currently {used:g}% used).",
-                        ephemeral=True,
+            def _db_add():
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (case.strip(),))
+                    row = cur.fetchone()
+                    if not row:
+                        return ("notfound", None)
+                    cid = int(row[0])
+                    cur.execute(
+                        "SELECT COALESCE(SUM(chance), 0), COALESCE(MAX(chance) FILTER (WHERE role_id = %s), 0) "
+                        "FROM mcwv_case_contents WHERE case_id = %s",
+                        (role.id, cid),
                     )
-                cur.execute("""
-                    INSERT INTO mcwv_case_contents (case_id, role_id, chance)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (case_id, role_id) DO UPDATE SET chance = EXCLUDED.chance
-                """, (cid, role.id, chance))
-            conn.commit()
+                    used, previous = (float(x or 0) for x in cur.fetchone())
+                    new_total = used - previous + chance
+                    if new_total > 100:
+                        return ("toomuch", (new_total, used))
+                    cur.execute("""
+                        INSERT INTO mcwv_case_contents (case_id, role_id, chance)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (case_id, role_id) DO UPDATE SET chance = EXCLUDED.chance
+                    """, (cid, role.id, chance))
+                    conn.commit()
+                    return ("ok", new_total)
+            status, payload = await async_db(_db_add)
+            if status == "notfound":
+                return await interaction.followup.send("❌ Case not found.", ephemeral=True)
+            if status == "toomuch":
+                new_total, used = payload
+                return await interaction.followup.send(
+                    f"❌ Chances would total {new_total:g}% — max 100% (currently {used:g}% used).",
+                    ephemeral=True,
+                )
             await games_refresh_interaction_caches()
-            return await interaction.followup.send(f"✅ {role.mention} added to **{case}** at **{chance:g}%** (total now {new_total:g}%).", ephemeral=True)
+            return await interaction.followup.send(f"✅ {role.mention} added to **{case}** at **{chance:g}%** (total now {payload:g}%).", ephemeral=True)
 
         if action == "remove":
             if not case or role is None:
                 return await interaction.followup.send("Usage: `/caseadmin remove` with case + @role.", ephemeral=True)
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (case.strip(),))
-                row = cur.fetchone()
-                if not row:
-                    return await interaction.followup.send("❌ Case not found.", ephemeral=True)
-                cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s AND role_id = %s", (int(row[0]), role.id))
-            conn.commit()
+            def _db_remove():
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (case.strip(),))
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s AND role_id = %s", (int(row[0]), role.id))
+                    conn.commit()
+                    return True
+            removed = await async_db(_db_remove)
+            if not removed:
+                return await interaction.followup.send("❌ Case not found.", ephemeral=True)
             await games_refresh_interaction_caches()
             return await interaction.followup.send(f"✅ {role.mention} removed from **{case}**.", ephemeral=True)
 
@@ -6747,47 +7353,68 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
         if action == "delete":
             if not case:
                 return await interaction.followup.send("Usage: `/caseadmin delete` + case name.", ephemeral=True)
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (case.strip(),))
-                row = cur.fetchone()
-                if not row:
-                    return await interaction.followup.send("❌ Case not found.", ephemeral=True)
-                cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s", (row[0],))
-                cur.execute("DELETE FROM mcwv_cases WHERE id = %s", (row[0],))
-            conn.commit()
+            def _db_delete():
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM mcwv_cases WHERE LOWER(name) = LOWER(%s)", (case.strip(),))
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    cur.execute("DELETE FROM mcwv_case_contents WHERE case_id = %s", (row[0],))
+                    cur.execute("DELETE FROM mcwv_cases WHERE id = %s", (row[0],))
+                    conn.commit()
+                    return True
+            deleted = await async_db(_db_delete)
+            if not deleted:
+                return await interaction.followup.send("❌ Case not found.", ephemeral=True)
             await games_refresh_interaction_caches()
             return await interaction.followup.send(f"✅ Case **{case}** deleted (roll history kept).", ephemeral=True)
 
         if action == "toggle":
             if not case:
                 return await interaction.followup.send("Usage: `/caseadmin toggle` + case name.", ephemeral=True)
-            with conn.cursor() as cur:
-                cur.execute("UPDATE mcwv_cases SET enabled = NOT enabled WHERE LOWER(name) = LOWER(%s) RETURNING enabled", (case.strip(),))
-                row = cur.fetchone()
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE mcwv_cases SET enabled = NOT enabled WHERE LOWER(name) = LOWER(%s) RETURNING enabled", (case.strip(),))
+                        row = cur.fetchone()
+                    conn.commit()
+                    return row
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            row = await async_db(_db_step)
             if not row:
                 return await interaction.followup.send("❌ Case not found.", ephemeral=True)
             await games_refresh_interaction_caches()
             return await interaction.followup.send(f"✅ **{case}** is now {'enabled 🟢' if row[0] else 'disabled 🔴'}.", ephemeral=True)
 
         if action == "stats":
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT c.name, COUNT(r.id), COALESCE(SUM(r.price_paid), 0)
-                    FROM mcwv_cases c
-                    LEFT JOIN mcwv_case_rolls r ON r.case_id = c.id
-                    GROUP BY c.id, c.name ORDER BY 3 DESC
-                """)
-                rows = cur.fetchall()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT c.name, COUNT(r.id), COALESCE(SUM(r.price_paid), 0)
+                            FROM mcwv_cases c
+                            LEFT JOIN mcwv_case_rolls r ON r.case_id = c.id
+                            GROUP BY c.id, c.name ORDER BY 3 DESC
+                        """)
+                        rows = cur.fetchall()
+                    return rows
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            rows = await async_db(_db_step)
             lines = [f"• **{n}** — {cnt} rolls · {sum_paid:,} coins sunk" for n, cnt, sum_paid in rows] or ["No cases yet."]
             embed = discord.Embed(title="🎁 Case Stats", description="\n".join(lines), color=discord.Color.from_rgb(168, 130, 255))
             return await interaction.followup.send(embed=embed, ephemeral=True)
 
     except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         print(f"[games] caseadmin failed: {exc}")
         return await interaction.followup.send(f"❌ Failed: `{type(exc).__name__}`", ephemeral=True)
     return await interaction.followup.send("❓ Unknown action.", ephemeral=True)
@@ -6891,9 +7518,9 @@ async def games_trivia_next(ctx, session):
         game_key = session.get("game", "trivia")
         award = score * GAMES_TRIVIA_CORRECT_REWARD + (GAMES_TRIVIA_PERFECT_BONUS if score == total else 0)
         if award:
-            games_coin_adjust(session["user_id"], award, f"{game_key}_win", meta={"score": score, "total": total})
-            games_track(game_key, getattr(ctx.channel, "id", 0), minted=award)
-        games_track_user(game_key, session["user_id"], win=score >= max(1, (total + 1) // 2))
+            await async_db(games_coin_adjust(session["user_id"], award, f"{game_key}_win", meta={"score": score, "total": total}))
+            await async_db(games_track(game_key, getattr(ctx.channel, "id", 0), minted=award))
+        await async_db(games_track_user(game_key, session["user_id"], win=score >= max(1, (total + 1) // 2)))
         ACTIVE_TRIVIA.pop(session["user_id"], None)
         rank, rank_color, stars = ("S", "gold", "⭐⭐⭐") if score == total else (
             ("A", "green", "⭐⭐") if score >= total - 1 else
@@ -6935,7 +7562,8 @@ async def games_trivia(interaction: discord.Interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.user.id in ACTIVE_TRIVIA:
         return await interaction.followup.send("❌ You already have a trivia session running — finish it first!", ephemeral=True)
-    allowed, retry_at = (True, None) if games_is_unlimited(interaction.user.id) else \
+    _dbv1_6955 = await async_db(games_is_unlimited(interaction.user.id))
+    allowed, retry_at = (True, None) if _dbv1_6955 else \
         games_cooldown_claim(interaction.user.id, "trivia", GAMES_TRIVIA_COOLDOWN)
     if not allowed:
         retry = discord.utils.format_dt(retry_at, "R") if retry_at else "soon"
@@ -7341,11 +7969,11 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
     await interaction.response.defer()
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
-    eggs = games_get_eggs()
+    eggs = await async_db(games_get_eggs())
     if not eggs:
         return await interaction.followup.send("❌ No eggs available right now.", ephemeral=True)
 
-    featured_slug = games_featured_egg()
+    featured_slug = await async_db(games_featured_egg())
     egg_def = None
     if egg:
         egg_def = next((e for e in eggs if e["name"].lower() == egg.lower()), None)
@@ -7361,10 +7989,11 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
             ephemeral=True,
         )
 
-    free, used = games_free_use(interaction.user.id, "hatch")
+    free, used = await async_db(games_free_use(interaction.user.id, "hatch"))
     if not free:
-        if not games_prepaid_consume(interaction.user.id, "hatch"):
-            ok, res = games_coin_spend(interaction.user.id, GAMES_HATCH_COST, "hatch_extra", meta={"egg": egg_name})
+        _dbv1_7383 = await async_db(games_prepaid_consume(interaction.user.id, "hatch"))
+        if not _dbv1_7383:
+            ok, res = await async_db(games_coin_spend(interaction.user.id, GAMES_HATCH_COST, "hatch_extra", meta={"egg": egg_name}))
             if not ok:
                 return await interaction.followup.send(f"❌ {res}", ephemeral=True)
 
@@ -7372,26 +8001,35 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
         pet_name, tier, real_chance = games_hatch_roll_featured(egg_def)
     else:
         pet_name, tier, real_chance = games_hatch_roll(egg_def)
-    games_coin_log_zero(interaction.user.id, "hatch", meta={"egg": egg_name, "free": free, "featured": is_featured})
+    await async_db(games_coin_log_zero(interaction.user.id, "hatch", meta={"egg": egg_name, "free": free, "featured": is_featured}))
 
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO mcwv_pet_collections (discord_id, pet_key, count)
-                VALUES (%s, %s, 1)
-                ON CONFLICT (discord_id, pet_key) DO UPDATE SET count = mcwv_pet_collections.count + 1
-            """, (interaction.user.id, pet_name))
-        conn.commit()
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO mcwv_pet_collections (discord_id, pet_key, count)
+                        VALUES (%s, %s, 1)
+                        ON CONFLICT (discord_id, pet_key) DO UPDATE SET count = mcwv_pet_collections.count + 1
+                    """, (interaction.user.id, pet_name))
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        await async_db(_db_step)
     except Exception as exc:
         print(f"[games] collection upsert failed: {exc}")
 
     asset_id = games_pet_asset(pet_name)
     icon = await games_fetch_pet_icon(asset_id) if asset_id else None
-    games_track(
+    await async_db(games_track(
         "hatch", interaction.channel_id,
         burned=0 if free or games_is_unlimited(interaction.user.id) else GAMES_HATCH_COST,
-    )
-    games_track_user("hatch", interaction.user.id, win=tier in ("titanic", "huge", "gargantuan"))
+    ))
+    await async_db(games_track_user("hatch", interaction.user.id, win=tier in ("titanic", "huge", "gargantuan")))
 
     tier_emoji, tier_label, tier_rgb = games_tier_style(tier)
     odds_txt = f"{real_chance:g}%" if real_chance is not None else "—"
@@ -7401,15 +8039,25 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
     exist_count = 0
     owned = 0
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT exist_count FROM mcwv_game_pets WHERE LOWER(name) = LOWER(%s) LIMIT 1", (pet_name,))
-            row = cur.fetchone()
-            if row:
-                exist_count = int(row[0] or 0)
-            cur.execute("SELECT count FROM mcwv_pet_collections WHERE discord_id = %s AND pet_key = %s", (interaction.user.id, pet_name))
-            row2 = cur.fetchone()
-            if row2:
-                owned = int(row2[0] or 0)
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT exist_count FROM mcwv_game_pets WHERE LOWER(name) = LOWER(%s) LIMIT 1", (pet_name,))
+                    row = cur.fetchone()
+                    if row:
+                        exist_count = int(row[0] or 0)
+                    cur.execute("SELECT count FROM mcwv_pet_collections WHERE discord_id = %s AND pet_key = %s", (interaction.user.id, pet_name))
+                    row2 = cur.fetchone()
+                    if row2:
+                        owned = int(row2[0] or 0)
+                return exist_count, owned
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        exist_count, owned = await async_db(_db_step)
     except Exception:
         pass
 
@@ -7476,11 +8124,11 @@ async def games_eggs(interaction: discord.Interaction, egg: str = None):
     await interaction.response.defer(ephemeral=True)
     if not games_gate_allowed(interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
-    eggs = games_get_eggs()
+    eggs = await async_db(games_get_eggs())
     if not eggs:
         return await interaction.followup.send("No eggs synced yet — try `/gamesadmin sync` (owner).", ephemeral=True)
 
-    featured_slug = games_featured_egg()
+    featured_slug = await async_db(games_featured_egg())
     if egg:
         target = next((e for e in eggs if e["name"].lower() == egg.lower()), None)
         if not target:
@@ -7906,12 +8554,22 @@ async def games_check_duelist_role(guild, winner_id):
 # ---------- TOWER MASTER: top-3 all-time ----------
 async def games_check_tower_master(guild, user_id):
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT discord_id FROM mcwv_tower_scores
-                ORDER BY best_floor DESC, best_score DESC LIMIT 3
-            """)
-            top3 = {int(r[0]) for r in cur.fetchall()}
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT discord_id FROM mcwv_tower_scores
+                        ORDER BY best_floor DESC, best_score DESC LIMIT 3
+                    """)
+                    top3 = {int(r[0]) for r in cur.fetchall()}
+                return top3
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        top3 = await async_db(_db_step)
         if int(user_id) in top3:
             await games_grant_role(guild, user_id, "towermaster")
     except Exception as exc:
@@ -7921,28 +8579,38 @@ async def games_check_tower_master(guild, user_id):
 # ---------- PET MASTER: monthly top guesser (housekeeping job) ----------
 async def games_monthly_petmaster(guild):
     try:
-        last = db_get_setting("games_petmaster_month", "")
+        last = await async_db(db_get_setting("games_petmaster_month", ""))
         month = datetime.now(timezone.utc).strftime("%Y-%m")
         if not last:
             # Establish a baseline; don't crown/reset mid-month on first deploy.
-            db_set_setting("games_petmaster_month", month)
+            await async_db(db_set_setting("games_petmaster_month", month))
             return
         if last == month:
             return
-        prev_holder = db_get_setting("games_petmaster_holder", "0")
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT target_id, COUNT(*) AS wins
-                FROM mcwv_coin_log
-                WHERE type = 'guess_win'
-                  AND created_at >= date_trunc('month', NOW()) - INTERVAL '1 month'
-                  AND created_at < date_trunc('month', NOW())
-                GROUP BY target_id
-                ORDER BY wins DESC, target_id ASC LIMIT 1
-            """)
-            row = cur.fetchone()
+        prev_holder = await async_db(db_get_setting("games_petmaster_holder", "0"))
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT target_id, COUNT(*) AS wins
+                        FROM mcwv_coin_log
+                        WHERE type = 'guess_win'
+                          AND created_at >= date_trunc('month', NOW()) - INTERVAL '1 month'
+                          AND created_at < date_trunc('month', NOW())
+                        GROUP BY target_id
+                        ORDER BY wins DESC, target_id ASC LIMIT 1
+                    """)
+                    row = cur.fetchone()
+                return row
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        row = await async_db(_db_step)
         if not row or int(row[1] or 0) <= 0:
-            db_set_setting("games_petmaster_month", month)
+            await async_db(db_set_setting("games_petmaster_month", month))
             return
         new_holder = int(row[0])
         # remove from previous holder, grant to new
@@ -7957,10 +8625,11 @@ async def games_monthly_petmaster(guild):
         except Exception as exc:
             print(f"[games] petmaster prev removal failed: {exc}")
         await games_grant_role(guild, new_holder, "petmaster")
-        db_set_setting("games_petmaster_holder", str(new_holder))
-        db_set_setting("games_petmaster_month", month)
+        await async_db(db_set_setting("games_petmaster_holder", str(new_holder)))
+        await async_db(db_set_setting("games_petmaster_month", month))
         try:
-            chans = json.loads(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]") or "[]")
+            _dbv1_7980 = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
+            chans = json.loads(_dbv1_7980 or "[]")
             channel = bot.get_channel(int(chans[0])) if chans else None
             if channel:
                 await channel.send(f"🐾 **Pet Master of the month:** <@{new_holder}> — most Guess-the-Pet wins! The crown moves on.")
@@ -8140,22 +8809,32 @@ async def games_tower_finish(channel, user, session, reached_roof=False):
     reached = min(int(session["floor"]) - 1, GAMES_TOWER_MAX_FLOOR)
     best = 0
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO mcwv_tower_scores (discord_id, best_floor, best_score, runs)
-                VALUES (%s,%s,%s,1)
-                ON CONFLICT (discord_id) DO UPDATE SET
-                    best_floor = GREATEST(mcwv_tower_scores.best_floor, EXCLUDED.best_floor),
-                    best_score = GREATEST(mcwv_tower_scores.best_score, EXCLUDED.best_score),
-                    runs = mcwv_tower_scores.runs + 1, reached_at = NOW()
-                RETURNING best_floor
-            """, (user.id, reached, session["score"]))
-            best = int(cur.fetchone()[0] or 0)
-        conn.commit()
+        def _db_step():
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO mcwv_tower_scores (discord_id, best_floor, best_score, runs)
+                        VALUES (%s,%s,%s,1)
+                        ON CONFLICT (discord_id) DO UPDATE SET
+                            best_floor = GREATEST(mcwv_tower_scores.best_floor, EXCLUDED.best_floor),
+                            best_score = GREATEST(mcwv_tower_scores.best_score, EXCLUDED.best_score),
+                            runs = mcwv_tower_scores.runs + 1, reached_at = NOW()
+                        RETURNING best_floor
+                    """, (user.id, reached, session["score"]))
+                    best = int(cur.fetchone()[0] or 0)
+                conn.commit()
+                return best
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        best = await async_db(_db_step)
     except Exception as exc:
         print(f"[games] tower score save failed: {exc}")
-    games_track("tower", getattr(channel, "id", 0), minted=session["score"])
-    games_track_user("tower", user.id, win=reached_roof or reached >= 5)
+    await async_db(games_track("tower", getattr(channel, "id", 0), minted=session["score"]))
+    await async_db(games_track_user("tower", user.id, win=reached_roof or reached >= 5))
     try:
         guild = bot.get_guild(GUILD_ID)
         if guild:
@@ -8163,6 +8842,7 @@ async def games_tower_finish(channel, user, session, reached_roof=False):
     except Exception:
         pass
     ACTIVE_TOWER.pop(user.id, None)
+    await async_db(games_session_end, f"tower:{int(user.id)}")
     embed = discord.Embed(
         title="👑 Tower Conquered!" if reached_roof else "💀 Tower Run Over",
         description=(
@@ -8189,7 +8869,7 @@ async def games_tower_result_from_chat(channel, user, correct):
         award = cleared_floor * 25 + combo_bonus
         session["floor"] += 1
         session["score"] += award
-        games_coin_adjust(user.id, award, "tower_floor", meta={"floor": cleared_floor, "combo": session["combo"]})
+        await async_db(games_coin_adjust(user.id, award, "tower_floor", meta={"floor": cleared_floor, "combo": session["combo"]}))
         embed = discord.Embed(
             title=f"✅ Floor {cleared_floor} Clear!",
             description=(f"<@{user.id}> reached the roof!" if cleared_floor >= GAMES_TOWER_MAX_FLOOR
@@ -8226,6 +8906,7 @@ async def games_tower_timeout(user_id, session):
     channel = bot.get_channel(int(session.get("channel_id", 0)))
     if channel is None:
         ACTIVE_TOWER.pop(int(user_id), None)
+        await async_db(games_session_end, f"tower:{int(user_id)}")
         return
     session["kind"] = None
     try:
@@ -8313,6 +8994,14 @@ async def games_tower_ask_chat(channel, user_id):
         old_task.cancel()
     task = asyncio.create_task(games_tower_timeout_after(user_id, session["floor_started"]))
     ACTIVE_TOWER_TIMEOUT_TASKS[int(user_id)] = task
+    await async_db(games_session_save, f"tower:{int(user_id)}", "tower", {
+        "user_id": int(user_id), "floor": session["floor"], "hearts": session.get("hearts", 3),
+        "score": session.get("score", 0), "combo": session.get("combo", 0),
+        "active": True, "started": session.get("started", 0),
+        "floor_started": session["floor_started"], "channel_id": session.get("channel_id"),
+        "kind": session.get("kind"), "answer": session.get("answer"),
+        "trivia_answer": session.get("trivia_answer"), "trivia_options": session.get("trivia_options"),
+    })
 
 
 
@@ -8550,24 +9239,34 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
                 ephemeral=True,
             )
         try:
-            with conn:
-                with conn.cursor() as cur:
-                    for table in (
-                        "mcwv_case_rolls", "mcwv_coin_log", "mcwv_pet_collections", "mcwv_duels",
-                        "mcwv_game_stats", "mcwv_bingo_cards", "mcwv_user_stats", "mcwv_guess_profiles",
-                        "mcwv_lottery_tickets", "mcwv_lottery_draws", "mcwv_tower_scores",
-                        "mcwv_game_cooldowns", "mcwv_petdle_progress", "mcwv_coins",
-                    ):
-                        cur.execute(f"DELETE FROM {table}")
-                    seed = int(db_get_setting(GAMES_SETTING_JACKPOT_SEED, "5000") or 5000)
-                    cur.execute(
-                        "UPDATE settings SET value = '0' WHERE key = %s",
-                        (GAMES_SETTING_LOTTERY_POOL,),
-                    )
-                    cur.execute(
-                        "UPDATE settings SET value = %s WHERE key = %s",
-                        (str(seed), GAMES_SETTING_JACKPOT),
-                    )
+            def _db_step():
+                try:
+                    with conn:
+                        with conn.cursor() as cur:
+                            for table in (
+                                "mcwv_case_rolls", "mcwv_coin_log", "mcwv_pet_collections", "mcwv_duels",
+                                "mcwv_game_stats", "mcwv_bingo_cards", "mcwv_user_stats", "mcwv_guess_profiles",
+                                "mcwv_lottery_tickets", "mcwv_lottery_draws", "mcwv_tower_scores",
+                                "mcwv_game_cooldowns", "mcwv_petdle_progress", "mcwv_coins",
+                            ):
+                                cur.execute(f"DELETE FROM {table}")
+                            seed = int(db_get_setting(GAMES_SETTING_JACKPOT_SEED, "5000") or 5000)
+                            cur.execute(
+                                "UPDATE settings SET value = '0' WHERE key = %s",
+                                (GAMES_SETTING_LOTTERY_POOL,),
+                            )
+                            cur.execute(
+                                "UPDATE settings SET value = %s WHERE key = %s",
+                                (str(seed), GAMES_SETTING_JACKPOT),
+                            )
+                    return cur, seed
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            cur, seed = await async_db(_db_step)
             ACTIVE_GUESS_ROUNDS.clear()
             for task in ACTIVE_GUESS_TASKS.values():
                 task.cancel()
@@ -8595,9 +9294,19 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
 
     if action == "stats":
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT game, sessions, coins_minted, coins_burned, last_played FROM mcwv_game_stats ORDER BY sessions DESC LIMIT 15")
-                rows = cur.fetchall()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT game, sessions, coins_minted, coins_burned, last_played FROM mcwv_game_stats ORDER BY sessions DESC LIMIT 15")
+                        rows = cur.fetchall()
+                    return rows
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            rows = await async_db(_db_step)
             embed = discord.Embed(title="🎮 Game Stats", color=games_color("gold"))
             game_emoji = {
                 "guess": "🐾", "hatch": "🥚", "spin": "🎡", "scratch": "🎴", "trivia": "🧠",
@@ -8606,9 +9315,12 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             }
             lines = [f"{game_emoji.get(str(g), '🎮')} **{g}** — `{s}` sessions · +{m:,} minted · −{b:,} burned" for g, s, m, b, _ in rows] or ["Nothing played yet!"]
             embed.description = "\n".join(lines)
-            embed.add_field(name="🎰 Spin jackpot", value=f"**{games_jackpot_get():,}** 🪙", inline=True)
-            embed.add_field(name="🥚 Eggs synced", value=str(len(games_get_eggs())), inline=True)
-            embed.add_field(name="🐾 Pets synced", value=str(len(games_get_pets())), inline=True)
+            _dbv1_8626 = await async_db(games_jackpot_get())
+            embed.add_field(name="🎰 Spin jackpot", value=f"**{_dbv1_8626:,}** 🪙", inline=True)
+            _dbv1_8627 = await async_db(games_get_eggs())
+            embed.add_field(name="🥚 Eggs synced", value=str(len(_dbv1_8627)), inline=True)
+            _dbv1_8628 = await async_db(games_get_pets())
+            embed.add_field(name="🐾 Pets synced", value=str(len(_dbv1_8628)), inline=True)
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as exc:
             await interaction.followup.send(f"❌ Stats failed: `{type(exc).__name__}`", ephemeral=True)
@@ -8618,7 +9330,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         new_state = str(value or "").strip().lower()
         if new_state not in ("on", "off"):
             return await interaction.followup.send("Usage: value = `on` or `off`.", ephemeral=True)
-        db_set_setting(GAMES_SETTING_ENABLED, "1" if new_state == "on" else "0")
+        await async_db(db_set_setting(GAMES_SETTING_ENABLED, "1" if new_state == "on" else "0"))
         return await interaction.followup.send(f"✅ Games are now **{'PUBLIC' if new_state == 'on' else 'TESTING-ONLY'}**.", ephemeral=True)
 
     if action == "tester_add":
@@ -8626,9 +9338,18 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         if not uid:
             return await interaction.followup.send("Mention a user: `/gamesadmin tester add @user`.", ephemeral=True)
         try:
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO mcwv_game_testers (discord_id, added_by) VALUES (%s,%s) ON CONFLICT (discord_id) DO NOTHING", (uid, interaction.user.id))
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("INSERT INTO mcwv_game_testers (discord_id, added_by) VALUES (%s,%s) ON CONFLICT (discord_id) DO NOTHING", (uid, interaction.user.id))
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            await async_db(_db_step)
             _games_tester_cache[uid] = (time.monotonic() + _GAMES_TESTER_CACHE_TTL, True)
             await interaction.followup.send(f"✅ <@{uid}> added as a game tester.", ephemeral=True)
         except Exception as exc:
@@ -8640,9 +9361,18 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         if not uid:
             return await interaction.followup.send("Mention a user to remove.", ephemeral=True)
         try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM mcwv_game_testers WHERE discord_id = %s", (uid,))
-            conn.commit()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM mcwv_game_testers WHERE discord_id = %s", (uid,))
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            await async_db(_db_step)
             _games_tester_cache[uid] = (time.monotonic() + _GAMES_TESTER_CACHE_TTL, False)
             await interaction.followup.send(f"✅ <@{uid}> removed from testers.", ephemeral=True)
         except Exception as exc:
@@ -8651,9 +9381,19 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
 
     if action == "tester_list":
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT discord_id FROM mcwv_game_testers ORDER BY added_at")
-                rows = cur.fetchall()
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT discord_id FROM mcwv_game_testers ORDER BY added_at")
+                        rows = cur.fetchall()
+                    return rows
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            rows = await async_db(_db_step)
             await interaction.followup.send("Testers: " + (" ".join(f"<@{r[0]}>" for r in rows) if rows else "none (owner only)"), ephemeral=True)
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed: `{type(exc).__name__}`", ephemeral=True)
@@ -8665,7 +9405,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         except Exception:
             return await interaction.followup.send("Usage: value = percent (e.g. 1 = 1% per message).", ephemeral=True)
         safe_pct = max(0.0, min(100.0, pct))
-        db_set_setting(GAMES_SETTING_SPAWN_CHANCE, str(safe_pct))
+        await async_db(db_set_setting(GAMES_SETTING_SPAWN_CHANCE, str(safe_pct)))
         return await interaction.followup.send(f"✅ Spawn chance set to **{safe_pct:g}%** per message.", ephemeral=True)
 
     if action in ("spawn_add", "spawn_remove"):
@@ -8680,7 +9420,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
                 "❌ I can't find that channel — mention it directly (e.g. `#games`).", ephemeral=True)
         if getattr(chan, "type", None) not in (discord.ChannelType.text, discord.ChannelType.news):
             return await interaction.followup.send("❌ Spawns only work in text channels.", ephemeral=True)
-        raw = db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]")
+        raw = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
         try:
             chans = json.loads(raw or "[]")
         except Exception:
@@ -8689,14 +9429,14 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             chans.append(cid)
         elif action == "spawn_remove" and cid in chans:
             chans.remove(cid)
-        db_set_setting(GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans))
+        await async_db(db_set_setting(GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans)))
         names = " ".join(f"<#{c}>" for c in chans) or "none"
         return await interaction.followup.send(
             f"✅ {'Added' if action == 'spawn_add' else 'Removed'} <#{cid}>\n"
             f"Active spawn channels: {names}", ephemeral=True)
 
     if action == "spawn_list":
-        raw = db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]")
+        raw = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
         try:
             chans = json.loads(raw or "[]")
         except Exception:
@@ -8718,9 +9458,12 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             ok_pets = await asyncio.to_thread(games_sync_pets_from_web)
             ok_eggs = await asyncio.to_thread(games_sync_eggs_v2)
             await games_refresh_interaction_caches()
-            pets = len(games_get_pets())
-            pets_with_icons = len(games_get_pets(require_asset=True))
-            eggs = len(games_get_eggs())
+            _dbv1_8738 = await async_db(games_get_pets())
+            pets = len(_dbv1_8738)
+            _dbv1_8739 = await async_db(games_get_pets(require_asset=True))
+            pets_with_icons = len(_dbv1_8739)
+            _dbv1_8740 = await async_db(games_get_eggs())
+            eggs = len(_dbv1_8740)
             await interaction.followup.send(
                 f"✅ Sync done — **{pets}** pets, **{pets_with_icons}** with unique icon assets, "
                 f"**{eggs}** eggs (pets {'ok' if ok_pets else 'FAILED'}, eggs {'ok' if ok_eggs else 'FAILED'}).",
@@ -8738,9 +9481,9 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             return await interaction.followup.send("Usage: value = `rate% [cap]` e.g. `1 100000`.", ephemeral=True)
         safe_rate = max(0.0, min(100.0, rate))
         safe_cap = max(0, cap) if cap is not None else None
-        db_set_setting(GAMES_SETTING_INTEREST_RATE, str(safe_rate))
+        await async_db(db_set_setting(GAMES_SETTING_INTEREST_RATE, str(safe_rate)))
         if safe_cap is not None:
-            db_set_setting(GAMES_SETTING_INTEREST_CAP, str(safe_cap))
+            await async_db(db_set_setting(GAMES_SETTING_INTEREST_CAP, str(safe_cap)))
         return await interaction.followup.send(
             f"✅ Interest: **{safe_rate:g}%/day** on up to **{safe_cap if safe_cap is not None else 'the current cap'}** banked.",
             ephemeral=True,
@@ -8754,7 +9497,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         if seed < 100:
             return await interaction.followup.send("❌ Seed must be at least 100.", ephemeral=True)
         games_jackpot_set(seed)
-        db_set_setting(GAMES_SETTING_JACKPOT_SEED, str(seed))
+        await async_db(db_set_setting(GAMES_SETTING_JACKPOT_SEED, str(seed)))
         return await interaction.followup.send(f"✅ Jackpot reset to **{seed:,}**.", ephemeral=True)
 
     if action == "role":
@@ -8767,21 +9510,21 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
             return await interaction.followup.send("Usage: value = `duelist|petmaster|towermaster @role`.", ephemeral=True)
         if kind not in ("duelist", "petmaster", "towermaster"):
             return await interaction.followup.send("❌ Kind must be duelist, petmaster or towermaster.", ephemeral=True)
-        db_set_setting(f"games_role_{kind}", str(rid))
+        await async_db(db_set_setting(f"games_role_{kind}", str(rid)))
         return await interaction.followup.send(f"✅ **{kind}** role set to <@&{rid}>.", ephemeral=True)
 
     if action == "setup":
         try:
             guild = interaction.guild
             ch = await guild.create_text_channel("games", reason="MCWV games channel setup")
-            raw = db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]")
+            raw = await async_db(db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]"))
             try:
                 chans = json.loads(raw or "[]")
             except Exception:
                 chans = []
             if ch.id not in chans:
                 chans.append(ch.id)
-            db_set_setting(GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans))
+            await async_db(db_set_setting(GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans)))
             guide = discord.Embed(
                 title="🎮 MCWV Games — Live Here!",
                 description=(
@@ -8841,10 +9584,20 @@ async def games_lottery(interaction: discord.Interaction, action: str, amount: i
         pool = games_lottery_pool()
         owned = games_lottery_owned(interaction.user.id)
         try:
-            round_key = games_lottery_round_key()
-            with conn.cursor() as cur:
-                cur.execute("SELECT COALESCE(SUM(tickets), 0) FROM mcwv_lottery_tickets WHERE week = %s", (round_key,))
-                total_entries = int(cur.fetchone()[0] or 0)
+            round_key = await async_db(games_lottery_round_key())
+            def _db_step():
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT COALESCE(SUM(tickets), 0) FROM mcwv_lottery_tickets WHERE week = %s", (round_key,))
+                        total_entries = int(cur.fetchone()[0] or 0)
+                    return total_entries
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            total_entries = await async_db(_db_step)
         except Exception:
             total_entries = 0
         odds = (owned / total_entries * 100) if total_entries else 0.0
@@ -8879,16 +9632,23 @@ async def games_tower(interaction: discord.Interaction):
     if session and session.get("active"):
         return await interaction.followup.send(
             f"🏗 You're already climbing — floor **{session['floor']}**, {session['hearts']} ❤️ left.", ephemeral=True)
-    free_run, runs_today = games_free_use(interaction.user.id, "tower")
-    if not free_run and not games_is_unlimited(interaction.user.id):
+    free_run, runs_today = await async_db(games_free_use(interaction.user.id, "tower"))
+    _dbv1_8900 = await async_db(games_is_unlimited(interaction.user.id))
+    if not free_run and not _dbv1_8900:
         return await interaction.followup.send(
             f"❌ You've used all **{GAMES_TOWER_RUNS_PER_DAY}** tower runs in this 24h window — come back tomorrow!", ephemeral=True)
-    games_coin_log_zero(interaction.user.id, "tower_run", meta={"runs_today": runs_today})
+    await async_db(games_coin_log_zero(interaction.user.id, "tower_run", meta={"runs_today": runs_today}))
+    _started = time.time()
     ACTIVE_TOWER[interaction.user.id] = {
         "user_id": interaction.user.id, "floor": 1, "hearts": 3, "score": 0,
-        "combo": 0, "active": True, "started": time.time(),
-        "floor_started": time.time(), "channel_id": interaction.channel.id,
+        "combo": 0, "active": True, "started": _started,
+        "floor_started": _started, "channel_id": interaction.channel.id,
     }
+    await async_db(games_session_save, f"tower:{interaction.user.id}", "tower", {
+        "user_id": interaction.user.id, "floor": 1, "hearts": 3, "score": 0,
+        "combo": 0, "active": True, "started": _started,
+        "floor_started": _started, "channel_id": interaction.channel.id,
+    })
     embed = discord.Embed(
         title="🏗 Tower of Pets",
         description=(
@@ -9021,7 +9781,8 @@ async def games_history_trivia(interaction: discord.Interaction):
         return await interaction.followup.send("🎮 Games are still in testing — coming soon.", ephemeral=True)
     if interaction.user.id in ACTIVE_TRIVIA:
         return await interaction.followup.send("❌ You already have a trivia session running — finish it first!", ephemeral=True)
-    allowed, retry_at = (True, None) if games_is_unlimited(interaction.user.id) else games_cooldown_claim(
+    _dbv1_9041 = await async_db(games_is_unlimited(interaction.user.id))
+    allowed, retry_at = (True, None) if _dbv1_9041 else games_cooldown_claim(
         interaction.user.id, "historytrivia", GAMES_HISTORY_TRIVIA_COOLDOWN
     )
     if not allowed:
@@ -9157,6 +9918,15 @@ async def on_ready():
         games_housekeeping_loop.start()
     if not games_event_loop_watchdog.is_running():
         games_event_loop_watchdog.start()
+    # Settle rounds that were live when the process last died. Guarded so a
+    # gateway reconnect (which also fires on_ready) never clobbers live
+    # in-memory state.
+    if not getattr(bot, "_games_sessions_recovered", False):
+        bot._games_sessions_recovered = True
+        try:
+            await games_recover_sessions()
+        except Exception as exc:
+            print(f"[games] session recovery failed: {exc}")
     await bot.change_presence(activity=discord.Game(name="MCWV Games · /games"))
     print(f"[discord] ready as {bot.user} ({bot.user.id})")
 
