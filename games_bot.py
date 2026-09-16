@@ -145,6 +145,8 @@ _games_case_catalog_cache = []
 _games_pet_choices_cache = []
 _games_pet_asset_cache = {}  # normalized pet name -> current asset ID
 _games_egg_choices_cache = []
+_games_interaction_cache_ts = 0.0  # monotonic timestamp of last successful refresh
+_GAMES_INTERACTION_CACHE_TTL = 1800.0  # seconds; admin edits/syncs bypass via force=True
 _games_tester_cache = {}
 _GAMES_TESTER_CACHE_TTL = 30.0
 
@@ -1681,10 +1683,21 @@ def games_new_db_connection():
     return c
 
 
-def games_refresh_interaction_caches_sync():
-    """Refresh DB-backed UI/autocomplete snapshots on a worker connection."""
-    global _games_case_choices_cache, _games_case_catalog_cache
+def games_refresh_interaction_caches_sync(force=False):
+    """Refresh DB-backed UI/autocomplete snapshots on a worker connection.
+
+    Skips the reload when the last successful refresh is newer than
+    _GAMES_INTERACTION_CACHE_TTL; pass force=True to always reload.
+    """
+    global _games_case_choices_cache, _games_case_catalog_cache, _games_interaction_cache_ts
     global _games_pet_choices_cache, _games_pet_asset_cache, _games_egg_choices_cache
+    if (
+        not force
+        and _games_interaction_cache_ts
+        and (time.monotonic() - _games_interaction_cache_ts) < _GAMES_INTERACTION_CACHE_TTL
+    ):
+        # Snapshot is fresh enough; skip the full cases/pets/eggs reload.
+        return True
     worker = None
     try:
         worker = games_new_db_connection()
@@ -1743,6 +1756,7 @@ def games_refresh_interaction_caches_sync():
             _games_pet_choices_cache = pets
             _games_pet_asset_cache = pet_assets
             _games_egg_choices_cache = eggs
+            _games_interaction_cache_ts = time.monotonic()
         return True
     except Exception as exc:
         print(f"[games] interaction cache refresh failed: {type(exc).__name__}")
@@ -1755,8 +1769,8 @@ def games_refresh_interaction_caches_sync():
                 pass
 
 
-async def games_refresh_interaction_caches():
-    return await asyncio.to_thread(games_refresh_interaction_caches_sync)
+async def games_refresh_interaction_caches(force=False):
+    return await asyncio.to_thread(games_refresh_interaction_caches_sync, force)
 
 
 def games_cooldown_claim(subject_id, game, seconds):
@@ -7224,7 +7238,7 @@ class CreateCaseModal(discord.ui.Modal, title="Create a role case"):
             duplicate = await async_db(_db_step)
             if duplicate:
                 return await interaction.followup.send("❌ A case with that name already exists.", ephemeral=True)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             await interaction.followup.send(
                 f"✅ Created {use_emoji} **{name}** for **{price:,} credits**. Press **Refresh** on the manager, select it, then add prizes.",
                 ephemeral=True,
@@ -7276,7 +7290,7 @@ class EditCaseModal(discord.ui.Modal, title="Edit case details"):
             row = await async_db(_db_step)
             if not row:
                 return await interaction.followup.send("❌ That case no longer exists.", ephemeral=True)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             await interaction.followup.send(
                 f"✅ Updated {use_emoji} **{self.case_name}** to **{price:,} credits**. Press **Refresh** on the manager.",
                 ephemeral=True,
@@ -7350,7 +7364,7 @@ class AddCasePrizeChanceModal(discord.ui.Modal, title="Set prize chance"):
             error, case_name, new_total = await async_db(_db_step)
             if error:
                 return await interaction.followup.send(f"❌ {error}", ephemeral=True)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             await interaction.followup.send(
                 f"✅ Set <@&{self.role_id}> to **{chance:.2f}%** in **{case_name}**. "
                 f"Configured total: **{new_total:.2f}%**. Press **Refresh** on the manager.",
@@ -7427,7 +7441,7 @@ class RemoveCasePrizeSelect(discord.ui.Select):
                         pass
                     raise
             row = await async_db(_db_step)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             await interaction.followup.send(
                 f"✅ Removed <@&{role_id}> from **{view.case_name}**." if row else "❌ Prize not found.",
                 ephemeral=True,
@@ -7486,7 +7500,7 @@ class DeleteCaseConfirmView(discord.ui.View):
                     raise
             deleted = await async_db(_db_step)
             self.stop()
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             await interaction.edit_original_response(
                 content=f"✅ Deleted **{self.case_name}**." if deleted else "❌ Case not found.",
                 embed=None,
@@ -7604,7 +7618,7 @@ class CaseAdminPanelView(discord.ui.View):
             row = await async_db(_db_step)
             if not row:
                 return await interaction.followup.send("❌ That case no longer exists.", ephemeral=True)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             await self.refresh_message(
                 interaction, notice=f"{case['name']} is now {'enabled' if row[0] else 'disabled'}."
             )
@@ -7683,7 +7697,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
             cid = await async_db(_db_create)
             if cid is None:
                 return await interaction.followup.send("❌ A case with that name already exists.", ephemeral=True)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             return await interaction.followup.send(
                 f"✅ Case **{case}** created ({price:,} coins, id {cid}){emoji_note}. Add roles with `/caseadmin add`.",
                 ephemeral=True)
@@ -7737,7 +7751,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
                     f"❌ Chances would total {new_total:g}% — max 100% (currently {used:g}% used).",
                     ephemeral=True,
                 )
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             return await interaction.followup.send(f"✅ {role.mention} added to **{case}** at **{chance:g}%** (total now {payload:g}%).", ephemeral=True)
 
         if action == "remove":
@@ -7755,7 +7769,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
             removed = await async_db(_db_remove)
             if not removed:
                 return await interaction.followup.send("❌ Case not found.", ephemeral=True)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             return await interaction.followup.send(f"✅ {role.mention} removed from **{case}**.", ephemeral=True)
 
         if action == "list":
@@ -7792,7 +7806,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
             deleted = await async_db(_db_delete)
             if not deleted:
                 return await interaction.followup.send("❌ Case not found.", ephemeral=True)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             return await interaction.followup.send(f"✅ Case **{case}** deleted (roll history kept).", ephemeral=True)
 
         if action == "toggle":
@@ -7814,7 +7828,7 @@ async def games_case_admin(interaction: discord.Interaction, action: str = "pane
             row = await async_db(_db_step)
             if not row:
                 return await interaction.followup.send("❌ Case not found.", ephemeral=True)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             return await interaction.followup.send(f"✅ **{case}** is now {'enabled 🟢' if row[0] else 'disabled 🔴'}.", ephemeral=True)
 
         if action == "stats":
@@ -9946,7 +9960,7 @@ async def games_admin(interaction: discord.Interaction, action: str, value: str 
         try:
             ok_pets = await asyncio.to_thread(games_sync_pets_from_web)
             ok_eggs = await asyncio.to_thread(games_sync_eggs_v2)
-            await games_refresh_interaction_caches()
+            await games_refresh_interaction_caches(force=True)
             _dbv1_8738 = await async_db(games_get_pets)
             pets = len(_dbv1_8738)
             _dbv1_8739 = await async_db(games_get_pets, require_asset=True)
